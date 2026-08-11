@@ -186,14 +186,19 @@ LogicalResult MakeTensorPtrConverter::matchAndRewrite(
 LogicalResult PreciseDivConverter::matchAndRewrite(
     triton::PreciseDivFOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
-  Value opa = op.getX();
-  Value opb = op.getY();
+  Value opa = adaptor.getX();
+  Value opb = adaptor.getY();
   auto loc = op.getLoc();
 
-  auto resType = dyn_cast<RankedTensorType>(op.getResult().getType());
-  auto divOp = rewriter.create<arith::DivFOp>(loc, resType, opa, opb);
+  if (opa.getType() != opb.getType())
+    return rewriter.notifyMatchFailure(op, "operands must have the same type");
 
-  rewriter.replaceOp(op, divOp);
+  // Let DivFOp infer its result type from converted operands.  PreciseDivFOp
+  // is valid for both scalar and tensor floating-point values; casting the
+  // original result to RankedTensorType made scalar divisions produce a null
+  // result type during partial conversion.
+  auto divOp = rewriter.create<arith::DivFOp>(loc, opa, opb);
+  rewriter.replaceOp(op, divOp.getResult());
   return success();
 }
 
@@ -1715,13 +1720,13 @@ LogicalResult ExternElementwiseClOpConverter::matchAndRewrite(
     }
 
     // extern libdevice ops -> hivm.hir.custom
-    static constexpr llvm::StringLiteral simtLibdeviceSuffixes[] = {
+    static constexpr llvm::StringLiteral libdeviceSuffixes[] = {
         "_fp32", "_fp16", "_bf16", "_i32", "_i64", "_u32", "_u64"};
-    bool isSimtLibdeviceOp =
-        llvm::any_of(simtLibdeviceSuffixes, [&](llvm::StringRef suffix) {
+    bool isLibdeviceOp =
+        llvm::any_of(libdeviceSuffixes, [&](llvm::StringRef suffix) {
           return op.getSymbol().ends_with(suffix);
         });
-    if (isSimtLibdeviceOp) {
+    if (isLibdeviceOp) {
       auto originalTensorType = isDstScalar
                                     ? RankedTensorType::get({1}, dstElemTy)
                                     : cast<RankedTensorType>(dstTy);
@@ -1829,6 +1834,7 @@ LogicalResult ExternElementwiseClOpConverter::matchAndRewrite(
       customOp->setAttr("symbol",
                         mlir::StringAttr::get(customOp->getContext(), sym));
       customOp->setAttr("arg_attrs", argAttrsArray);
+      customOp.setInlineMode(hivm::InlineMode::AlwaysInline);
 
       // Restore the result's shape and element type
       Value finalResult = customOp.getResults().front();
@@ -2178,12 +2184,13 @@ LogicalResult DeviceAssertConverter::matchAndRewrite(
     triton::AssertOp op, OpAdaptor adaptor,
     mlir::ConversionPatternRewriter &rewriter) const {
   auto msgAttr = op.getMessageAttr();
-  // The frontend marks only sanitize_overflow assertions.  A user may choose
-  // the same text for tl.device_assert, so message matching is not a safe
-  // provenance test here or in the graph rewrite.
-  if (op->hasAttr("tt.auto_overflow_assert")) {
-    rewriter.eraseOp(op);
-    return success();
+  // Filter out automatically inserted assert ops
+  if (auto strAttr = mlir::dyn_cast<mlir::StringAttr>(msgAttr)) {
+    llvm::StringRef msg = strAttr.getValue();
+    if (msg.contains("overflow detected for operation")) {
+      rewriter.eraseOp(op);
+      return success();
+    }
   }
 
   auto moduleOp = op->getParentOfType<ModuleOp>();
@@ -2220,7 +2227,20 @@ MatmulConverter::matchAndRewrite(triton::DotOp op, OpAdaptor adaptor,
   auto dstType = cast<RankedTensorType>(op.getType());
   auto elemTy = dstType.getElementType();
   auto inputPrec = op.getInputPrecision();
-
+  // Ascend does not support tf32;  map it to hf32 which provides similar
+  // functionality.HF32 is only valid for fp32 x fp32 inputs; for other
+  // dtypes, fall back to ieee.
+  if (inputPrec == InputPrecision::TF32) {
+    op->emitWarning("Ascend does not support tf32; map it to hf32.");
+    inputPrec = InputPrecision::HF32;
+  }
+  if (inputPrec == InputPrecision::HF32) {
+    auto opaElemTy = cast<RankedTensorType>(opa.getType()).getElementType();
+    auto opbElemTy = cast<RankedTensorType>(opb.getType()).getElementType();
+    if (!opaElemTy.isF32() || !opbElemTy.isF32()) {
+      inputPrec = InputPrecision::IEEE;
+    }
+  }
   auto createOp = [&](auto &&rewriter, ValueRange operands,
                       ValueRange results) -> Operation * {
     if (dstType.getRank() == 2)
@@ -3582,6 +3602,7 @@ HistogramConverter::matchAndRewrite(triton::HistogramOp op, OpAdaptor adaptor,
                                     ConversionPatternRewriter &rewriter) const {
   auto loc = op.getLoc();
   Value input = adaptor.getSrc();
+  Value mask = adaptor.getMask();
   auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
   if (!resultType || !resultType.hasStaticShape()) {
     return rewriter.notifyMatchFailure(op,
@@ -3600,10 +3621,14 @@ HistogramConverter::matchAndRewrite(triton::HistogramOp op, OpAdaptor adaptor,
 
   Value numBinsVal = rewriter.create<arith::ConstantIntOp>(loc, numBins, 64);
 
+  SmallVector<Value, 3> inputs = {input, numBinsVal};
+  if (mask) {
+    inputs.push_back(mask);
+  }
+
   auto customOp = rewriter.create<hivm::CustomOp>(
-      loc, TypeRange{resultType}, "__builtin_histogram",
-      ValueRange{input, numBinsVal}, ValueRange{fillOp.getResult(0)},
-      ValueRange{});
+      loc, TypeRange{resultType}, "__builtin_histogram", ValueRange{inputs},
+      ValueRange{fillOp.getResult(0)}, ValueRange{});
 
   customOp->setAttr("symbol", rewriter.getStringAttr("__builtin_histogram"));
   customOp->setAttr(
