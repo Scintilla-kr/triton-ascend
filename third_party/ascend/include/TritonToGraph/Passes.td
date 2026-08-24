@@ -69,4 +69,19 @@ def MergeConcatLoadBuffer : Pass<"merge-concat-load-buffer", "mlir::ModuleOp"> {
   let constructor = "mlir::triton::cfg::createMergeConcatLoadBufferPass()";
 }
 
+def GraphOptimize : Pass<"graph-optimize", "mlir::ModuleOp"> {
+  let summary = "Optimize Triton IR with graph analyses";
+  let constructor = "mlir::triton::cfg::createGraphOptimizePass()";
+  let options = [
+    Option<"ruleMask", "rule-mask", "uint64_t", "511",
+           "Bitmask of registered graph rule identities; this pass executes only native graph-rule phases">,
+    Option<"maxRewritesPerFunction", "max-rewrites-per-function", "uint64_t",
+           "64", "Maximum graph rewrites per function">,
+    Option<"ubCapacityBytes", "ub-capacity-bytes", "uint64_t", "0",
+           "Unified-buffer capacity available to StoreCoalescing">,
+    Option<"compileMode", "compile-mode", "std::string", "\"simd_simt_template\"",
+           "Compilation mode; RowCoalescing is enabled only for simt_only">,
+  ];
+}
+
 #endif // TRITON_TO_CFG_PASSES

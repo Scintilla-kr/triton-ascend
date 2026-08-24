@@ -23,10 +23,12 @@
 #ifndef ADD_AUTO_SCHEDULING_COMMON_UTILS_H
 #define ADD_AUTO_SCHEDULING_COMMON_UTILS_H
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Casting.h"
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -60,12 +62,16 @@ inline constexpr llvm::StringLiteral kLoopCarriedL0C =
 inline constexpr llvm::StringLiteral kCrossCoreDeps = "ssbuffer.crossCoreDeps";
 inline constexpr llvm::StringLiteral kIntraDeps = "ssbuffer.intraDeps";
 inline constexpr llvm::StringLiteral kMemCrossDeps = "ssbuffer.memCrossDeps";
+inline constexpr llvm::StringLiteral kDepMark = "ssbuffer.dep_mark";
 inline constexpr llvm::StringLiteral kMayNotExec = "ssbuffer.may_not_exec";
+inline constexpr llvm::StringLiteral kIterCounter = "ssbuffer.iterCounter";
+inline constexpr llvm::StringLiteral kForMayNotExec =
+    "ssbuffer.for_may_not_exec";
 inline constexpr llvm::StringLiteral kClone = "ssbuffer.clone";
-inline constexpr llvm::StringLiteral kEnableUbRefineOpt =
-    "ssbuffer.enable_ub_refine_opt";
 inline constexpr llvm::StringLiteral kInsertionOptimization =
     "ssbuffer.insertionOptimization";
+inline constexpr llvm::StringLiteral kArg = "ssbuffer.arg";
+inline constexpr llvm::StringLiteral kWhileArg = "ssbuffer.while_arg";
 static constexpr llvm::StringLiteral kInlinableQuantScaleAttr =
     "enable_fast_tf32_mul";
 inline constexpr llvm::StringLiteral kGMLoadMultiBufferHintAttr = "gm_load";
@@ -76,6 +82,7 @@ inline constexpr llvm::StringLiteral kTightlyCoupledBufferAttr =
     "hivm.tightly_coupled_buffer";
 inline constexpr llvm::StringLiteral kCoreTypeCube = "CUBE";
 inline constexpr llvm::StringLiteral kCoreTypeVector = "VECTOR";
+inline constexpr llvm::StringLiteral kFromMakeRange = "tt.from_make_range";
 
 inline constexpr const char *ERRCODE_ATTR =
     "triton_ascend.dynamic_cv_pipeline.rc";
@@ -121,8 +128,108 @@ bool isScfOp(Operation *op);
 bool isOnlyDirectlyUse(Operation *preOp, Operation *nextOp,
                        const CVPipeline::MemoryDependenceGraph &memGraph);
 
-inline bool isCubeOp(Operation *op) {
-  return !isScfOp(op) && CVPipeline::getOpCoreType(op) == CoreType::CUBE_ONLY;
+// Wrapper around a "main loop" — either scf.for or scf.while carrying the
+// ssbuffer.main_loop attribute. Lets downstream code treat both uniformly.
+class MainLoop {
+public:
+  Operation *op = nullptr;
+  Block *body = nullptr;
+  Value iterCounter;
+
+  Block *getBody() const;
+  Operation *getOperation() const;
+  MLIRContext *getContext() const;
+  Location getLoc() const;
+  Block *getBlock() const;
+  Block::iterator getIterator() const;
+  Operation *operator->() const;
+  bool isWhile() const;
+
+  // Iter args carried across loop iterations, as BlockArguments.
+  // forOp:   getRegionIterArgs().
+  // whileOp: after-body args.
+  SmallVector<Value> getIterArgs() const;
+
+  // Only meaningful for whileOp (before-body args); forOp returns empty.
+  // Same count/types as getIterArgs() on whileOp, distinct Value identity.
+  SmallVector<Value> getBeforeIterArgs() const;
+
+  explicit MainLoop(Operation *loopOp);
+
+  // Returns the scf.yield terminator of a forOp's body / whileOp's after
+  // body. Returns {} if `loopOp` is neither.
+  static scf::YieldOp getLoopYieldOp(Operation *loopOp);
+};
+
+// True when `op` is a main_loop loop op (forOp / whileOp carrying the tag).
+inline bool isMainLoopOp(Operation *op) {
+  return op && isa<scf::ForOp, scf::WhileOp>(op) && op->hasAttr(kMainLoop);
+}
+
+CoreType getCoreTypeOfSimpleOpOrCf(Operation *op);
+
+inline bool isCubeSimpleOpOrCf(Operation *op) {
+  return getCoreTypeOfSimpleOpOrCf(op) == CoreType::CUBE_ONLY;
+}
+
+inline bool isVectorSimpleOpOrCf(Operation *op) {
+  return getCoreTypeOfSimpleOpOrCf(op) == CoreType::VECTOR_ONLY;
+}
+
+// ============================================================================
+// Unified Loop Helpers: abstract ForOp/WhileOp differences
+// ============================================================================
+// Get the body block of a loop (ForOp's body or WhileOp's after-body block)
+inline Block *getLoopBodyBlock(Operation *loop) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loop))
+    return forOp.getBody();
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loop))
+    return whileOp.getAfterBody()->getNextNode();
+  return nullptr;
+}
+
+// Get the init values of a loop (ForOp's initArgs or WhileOp's inits)
+inline ValueRange getLoopInitValues(Operation *loop) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loop))
+    return forOp.getInitArgs();
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loop))
+    return whileOp.getInits();
+  return {};
+}
+
+// Get the yield terminator of a loop's body
+inline Operation *getLoopYieldOp(Operation *loop) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loop))
+    return forOp.getBody()->getTerminator();
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loop))
+    return whileOp.getAfterBody()->getTerminator();
+  return nullptr;
+}
+
+// Check if a block argument is an iter_arg of a loop (ForOp body or WhileOp
+// after-body)
+inline bool isLoopIterArg(BlockArgument blockArg) {
+  Operation *parentOp = blockArg.getOwner()->getParentOp();
+  if (isa<scf::ForOp>(parentOp))
+    return true;
+  if (auto whileOp = dyn_cast<scf::WhileOp>(parentOp))
+    return blockArg.getOwner() == whileOp.getAfterBody()->getNextNode();
+  return false;
+}
+
+// Helper: Check if a value is a scalar (not a tensor type)
+inline bool isScalarType(Value value) {
+  return !isa<RankedTensorType>(value.getType());
+}
+
+// Helper: Check if a value is a scalar iter_arg from scf.for or scf.while
+inline bool isScalarIterArgOp(Value iterArg) {
+  auto blockArg = dyn_cast<BlockArgument>(iterArg);
+  if (!blockArg)
+    return false;
+  if (!isLoopIterArg(blockArg))
+    return false;
+  return isScalarType(iterArg);
 }
 
 bool isVectorOnlyOp(Operation *op);
@@ -135,6 +242,7 @@ bool isViewLike(Operation *op);
 // 0 scalar constant. Used to detect the "add 0" operand of VECTOR pseudo-ops
 // (`arith.addf` / `arith.addi` carrying `ssbuffer.add_from_matmul`).
 bool isZeroFillValue(Value v);
+bool isZeroAdd(mlir::Operation *op);
 
 // Read the `hivm.tightly_coupled_buffer<N>` id attached to a `memref.alloc`
 // via its `annotation.mark` user. Returns nullopt when no annotation with
@@ -149,6 +257,59 @@ Value traceBackToMemrefAlloc(Value v);
 bool allResultHasOneUser(Operation *op);
 
 int64_t getBTSizeFromValidBroadcastOp(linalg::BroadcastOp broadcastOp);
+
+int getLoopCarriedArgIndex(Value operand, Block *block);
+
+// Helper: convert OpCoreType to string for IR attribute
+inline llvm::StringRef coreTypeToString(CoreType ct) {
+  switch (ct) {
+  case CUBE_ONLY:
+    return "CUBE";
+  case VECTOR_ONLY:
+    return "VECTOR";
+  case CUBE_AND_VECTOR:
+    return "CUBE_AND_VECTOR";
+  default:
+    return "UNDETERMINED";
+  }
+}
+
+inline OpOperand *getTiedYieldOperand(Value value, Block *block) {
+  int argIdx = getLoopCarriedArgIndex(value, block);
+  if (argIdx == -1) {
+    return nullptr;
+  }
+  auto *terminator = block->getTerminator();
+  return &terminator->getOpOperand(argIdx);
+}
+
+inline Operation *getLoopCarriedDefOp(Value value, Block *block) {
+  auto *yieldOperand = getTiedYieldOperand(value, block);
+  if (yieldOperand && yieldOperand->get()) {
+    return yieldOperand->get().getDefiningOp();
+  }
+  return nullptr;
+}
+
+inline bool isTensorComputeOp(Operation *op) {
+  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+    if (linalg::isaCopyOpInterface(linalgOp))
+      return false;
+    auto genericOp = dyn_cast<linalg::GenericOp>(op);
+    if (genericOp && linalg::isaBroadcastOpInterface(genericOp).has_value())
+      return false;
+    if (isa<linalg::FillOp>(op))
+      return false;
+    return true;
+  }
+
+  if (op->hasTrait<mlir::OpTrait::Elementwise>()) {
+    return llvm::any_of(op->getResultTypes(),
+                        [](Type t) { return isa<RankedTensorType>(t); });
+  }
+
+  return false;
+}
 
 } // namespace CVPipeline
 } // namespace mlir

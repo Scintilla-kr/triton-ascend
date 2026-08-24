@@ -35,12 +35,10 @@
 #include "Utils/Utils.h"
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
-#include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMInterfaces.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Block.h"
@@ -283,6 +281,30 @@ bool InterCoreTransferAndSyncPass::isExpectedShape(
   return isEqualedShape;
 }
 
+// insert copyop before store to avoid mte3 blocking (store and V->C use the
+// same PIPE)
+mlir::Operation *InterCoreTransferAndSyncPass::getCopyPointBeforeStore(
+    Value depValue, Operation *vectorEndOp, int iniProducerBlockId) {
+  Operation *curr = vectorEndOp;
+  Operation *firstStoreOpAfterProducer = nullptr;
+  while (curr) {
+    auto blockIdOpt = CVPipeline::getOpBlockId(curr);
+    if (blockIdOpt != iniProducerBlockId) {
+      break;
+    }
+    if (curr == depValue.getDefiningOp()) {
+      break;
+    }
+    if (CVPipeline::isStoreLike(curr)) {
+      firstStoreOpAfterProducer = curr->getPrevNode();
+      LOG_DEBUG("firstStoreOpAfterProducer: " << *firstStoreOpAfterProducer
+                                              << "\n");
+    }
+    curr = curr->getPrevNode();
+  }
+  return firstStoreOpAfterProducer;
+}
+
 // padding v->c tensor
 mlir::Value InterCoreTransferAndSyncPass::alignShapeByInsertSlice(
     OpBuilder &builder, DependencyInfo &dep, Location loc,
@@ -360,6 +382,7 @@ void InterCoreTransferAndSyncPass::Nd2NzNormalize(OpBuilder &builder,
     newValue = alignShapeByInsertSlice(builder, dep, loc, origValue,
                                        expectedShape, originBlockId);
   }
+
   // Step 3: insert nd2nz
   auto srcTensorType = cast<RankedTensorType>(newValue.getType());
   int64_t M = srcTensorType.getDimSize(0);
@@ -382,6 +405,13 @@ void InterCoreTransferAndSyncPass::Nd2NzNormalize(OpBuilder &builder,
 
   auto [newProdStart, newProdEnd] =
       getBlockStartEnd(dep.producerBlockId, module);
+  if (dep.iniProducerBlockId == dep.producerBlockId) {
+    auto producerPoint =
+        getCopyPointBeforeStore(newValue, newProdEnd, dep.iniProducerBlockId);
+    if (producerPoint) {
+      newProdEnd = producerPoint;
+    }
+  }
   builder.setInsertionPointAfter(newProdEnd);
 
   auto reshape3Dcst =
@@ -438,7 +468,7 @@ InterCoreTransferAndSyncPass::findMainLoopforTransfer(Operation *endOp,
   }
   Operation *current = lca;
   while (current) {
-    if (isa<scf::ForOp>(current)) {
+    if (isa<scf::ForOp, scf::WhileOp>(current)) {
       return current;
     }
     current = current->getParentOp();
@@ -523,7 +553,7 @@ InterCoreTransferAndSyncPass::getConsumerWaitPoint(int transferIndex) {
       return;
     }
     if (!isa<hivm::ConvertLayoutOp>(op) &&
-        !isa<memref::MemorySpaceCastOp>(op) && !isa<LLVM::LoadOp>(op)) {
+        !isa<memref::MemorySpaceCastOp>(op) && !isa<memref::LoadOp>(op)) {
       return;
     }
     auto transferIdAttr =
@@ -561,7 +591,7 @@ Operation *InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(
     Operation *storeOp = nullptr;
     for (Operation *op : writeOps) {
       attachTransferTags(op, vecBlockId, "VECTOR", transferIndex);
-      if (isa<LLVM::StoreOp>(op)) {
+      if (isa<memref::StoreOp>(op)) {
         storeOp = op;
       }
     }
@@ -582,7 +612,7 @@ Operation *InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(
     Operation *loadOp = nullptr;
     for (Operation *op : readOps) {
       attachTransferTags(op, cubeBlockId, "CUBE", transferIndex);
-      if (isa<LLVM::LoadOp>(op)) {
+      if (isa<memref::LoadOp>(op)) {
         loadOp = op;
       }
     }
@@ -697,7 +727,7 @@ Operation *InterCoreTransferAndSyncPass::insertCubeToVectorTransfer(
       srcValue,                  // src
       cubeAllocOp->getResult(0), // dst
       mlir::ValueRange{}, dmaModeAttr, nullptr, nullptr, nullptr, nullptr,
-      nullptr, nullptr, mlir::ArrayAttr{}, nullptr);
+      nullptr, nullptr, nullptr, mlir::ArrayAttr{}, nullptr);
   attachTransferTags(fixpipeOp, cubeBlockId, "CUBE", transferIndex);
   attachCrossCoreDeps(fixpipeOp, transferIndex, CVPipeline::crossCoreProducerId,
                       builder);
@@ -789,11 +819,12 @@ InterCoreTransferAndSyncPass::getTransferPipeConfig(Operation *transferOp,
     config.dstCoreAttr = cubeCoreAttr;
     config.srcCoreType = "VECTOR";
     config.dstCoreType = "CUBE";
-  } else if (isa<LLVM::StoreOp>(transferOp)) {
-    config.forReadTPipe = pipeVAttr;
-    config.forReadPipe = pipeFixAttr;
-    config.forWriteTPipe = pipeFixAttr;
-    config.forWritePipe = pipeVAttr;
+  } else if (isa<memref::StoreOp>(transferOp)) {
+    // Scalar sync uses PIPE_S to stay isolated from tensor flag space.
+    config.forReadTPipe = pipeSAttr;
+    config.forReadPipe = pipeSAttr;
+    config.forWriteTPipe = pipeSAttr;
+    config.forWritePipe = pipeSAttr;
     config.srcCoreAttr = vecCoreAttr;
     config.dstCoreAttr = cubeCoreAttr;
     config.srcCoreType = "VECTOR";
@@ -825,7 +856,8 @@ bool InterCoreTransferAndSyncPass::isStoreDirectlyInUserChain(
       }
 
       // Check if user is in skip range
-      if (CVPipeline::isViewLike(user)) {
+      if (CVPipeline::isViewLike(user) || CVPipeline::isZeroAdd(user) ||
+          user->hasAttr(CVPipeline::kForMayNotExec)) {
         // Continue traversing through skip ops
         for (Value result : user->getResults()) {
           if (!visited.count(result)) {
@@ -1294,14 +1326,19 @@ LogicalResult InterCoreTransferAndSyncPass::handleVectorToCube(
       consStart = consumerPoint;
     }
   }
+  if (dep.iniProducerBlockId == dep.producerBlockId) {
+    auto producerPoint =
+        getCopyPointBeforeStore(normalizedVal, prodEnd, dep.iniProducerBlockId);
+    if (producerPoint) {
+      prodEnd = producerPoint;
+    }
+  }
   LOG_DEBUG("after analyzeConsumerReadInsertPoint\n");
   Operation *transferOp = insertVectorToCubeTransfer(
       builder, srcValue, normalizedVal, prodEnd, consStart, loc, transferIndex,
       dep, is1DTensorDependency(dep.value), &consumedDataOp);
 
   int flagId = flagManager.acquireId();
-  auto [newProdStart, newProdEnd] =
-      getBlockStartEnd(dep.producerBlockId, module);
   auto [newConsStart, newConsEnd] =
       getBlockStartEnd(dep.consumerBlockId, module);
 
@@ -1716,8 +1753,7 @@ void InterCoreTransferAndSyncPass::getDependentDialects(
   registry.insert<func::FuncDialect, arith::ArithDialect, linalg::LinalgDialect,
                   scf::SCFDialect, tensor::TensorDialect,
                   bufferization::BufferizationDialect, memref::MemRefDialect,
-                  hivm::HIVMDialect, LLVM::LLVMDialect,
-                  annotation::AnnotationDialect>();
+                  hivm::HIVMDialect, annotation::AnnotationDialect>();
 }
 
 // Pass Entry Point
