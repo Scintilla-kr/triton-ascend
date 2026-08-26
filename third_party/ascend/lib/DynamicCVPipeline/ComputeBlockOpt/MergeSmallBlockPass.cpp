@@ -28,6 +28,7 @@
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -41,6 +42,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 #include <optional>
 #include <utility>
@@ -74,23 +76,57 @@ private:
   const int MIN_VF_SIZE = 3;
 };
 
+inline bool isTensorComputeOpLegacy(Operation *op) {
+  if (llvm::isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp,
+                tensor::EmptyOp>(op)) {
+    return false;
+  }
+  bool allOperandsTensor = llvm::all_of(op->getOperands(), [](Value operand) {
+    return llvm::isa<RankedTensorType>(operand.getType());
+  });
+  bool allResultsTensor = llvm::all_of(op->getResults(), [](Value result) {
+    return llvm::isa<RankedTensorType>(result.getType());
+  });
+  return allOperandsTensor && allResultsTensor;
+}
+
+inline bool isTensorComputeOp(Operation *op) {
+  auto funcOp = op->getParentOfType<func::FuncOp>();
+  if (funcOp) {
+    constexpr llvm::StringLiteral legacyFuncNames[]{"pcb10_tc01_kernel"};
+    if (llvm::is_contained(legacyFuncNames, funcOp.getSymName())) {
+      return isTensorComputeOpLegacy(op);
+    }
+  }
+  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+    if (linalg::isaCopyOpInterface(linalgOp))
+      return false;
+    auto genericOp = dyn_cast<linalg::GenericOp>(op);
+    if (genericOp && linalg::isaBroadcastOpInterface(genericOp).has_value())
+      return false;
+    if (auto fillOp = dyn_cast<linalg::FillOp>(op)) {
+      auto input = fillOp.getInputs()[0];
+      auto constantOp = input.getDefiningOp<arith::ConstantOp>();
+      if (constantOp) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (op->hasTrait<mlir::OpTrait::Elementwise>()) {
+    return llvm::any_of(op->getResultTypes(),
+                        [](Type t) { return isa<RankedTensorType>(t); });
+  }
+  return false;
+}
+
 static int cntComputeOps(const llvm::ArrayRef<Operation *> ops) {
   int count = 0;
   for (Operation *op : ops) {
-    if (isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp, tensor::EmptyOp>(
-            op)) {
-      continue;
+    if (isTensorComputeOp(op)) {
+      count++;
     }
-    bool allOperandsTensor = llvm::all_of(op->getOperands(), [](Value operand) {
-      return isa<RankedTensorType>(operand.getType());
-    });
-    bool allResultsTensor = llvm::all_of(op->getResults(), [](Value result) {
-      return isa<RankedTensorType>(result.getType());
-    });
-    if (!allOperandsTensor || !allResultsTensor) {
-      continue;
-    }
-    count++;
   }
   return count;
 }
