@@ -30,6 +30,7 @@ import gc
 import inspect
 import os
 import pprint
+import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -41,7 +42,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from torch import Tensor
 
 import triton
+from triton import knobs
+from triton._C.libtriton import get_cache_invalidating_env_vars
 from triton.runtime.autotuner import Autotuner, Config
+from triton.runtime.jit import compute_cache_key
 from triton.backends.ascend.utils import (_InternalNPUOptionInt, _remove_deprecated_npu_options,
                                           _RESERVED_NPU_OPTION_NAMES, is_compile_on_910_95)
 
@@ -78,6 +82,14 @@ _DEFAULT_COMPILE_MODE = "simd_simt_template"
 def _inject_default_simt_stack_limit(options: Dict[str, object], stack_limit: int) -> None:
     if options.get("compile_mode") == "simt_only" and options.get("simt_stack_limit") is None:
         options["simt_stack_limit"] = stack_limit
+
+
+def _format_autotune_timing(timing) -> str:
+    """Format the timing returned by the active autotune benchmarker."""
+    if isinstance(timing, (tuple, list)):
+        labels = ("p50", "p20", "p80")
+        return ", ".join(f"{label}={value:.4f} ms" for label, value in zip(labels, timing))
+    return f"mean={timing:.4f} ms"
 
 
 def _get_constexpr_candidates_from_fn(fn) -> List[str]:
@@ -350,6 +362,14 @@ class AutoTilingTuner(Autotuner):
                                  and os.getenv("TRITON_AUTOTUNE_PARALLEL_COMPILE", "1") == "1")
         self._source_module_ast_cache: Optional[ast.Module] = None
         self._source_module_ast_resolved = False
+
+        # Negative cache for deterministic compile failures.  This is keyed by
+        # the JIT compilation identity rather than the autotune tuning key, so
+        # a failed compile can be reused when only the tuning key changes while
+        # the actual compiler inputs remain identical.
+        self._compile_failure_cache: Dict[Tuple, Dict[str, str]] = {}
+        self._compile_failure_cache_lock = threading.Lock()
+        self._cached_compile_failed_configs: List[Config] = []
 
     @staticmethod
     def _parse_explicit_tunable_params(raw_value) -> List[str]:
@@ -2096,6 +2116,7 @@ class AutoTilingTuner(Autotuner):
         _inject_default_simt_stack_limit(kwargs, self.simt_stack_limit)
         did_benchmark = False
         disk_cache_hit = False
+        single_config_cache_pending = False
         if cache_miss:
             # prune configs
             pruned_configs = self.prune_configs(kwargs)
@@ -2114,24 +2135,14 @@ class AutoTilingTuner(Autotuner):
                     self.configs_timings = timings
 
                 if self.cache_results:
-                    if self.enable_ubtuner:
-                        warnings.warn(
-                            "Autotune disk cache is disabled because UB-tuner is enabled "
-                            "(TRITON_ENABLE_UBTUNER is set). UB-tuner may dynamically add "
-                            "compile-time fixes to configs that cannot be safely cached to disk. "
-                            "To enable disk caching, unset TRITON_ENABLE_UBTUNER.",
-                            RuntimeWarning,
-                            stacklevel=2,
-                        )
-                        benchmark()
-                    else:
-                        disk_cache_hit = self.check_disk_cache(key, pruned_configs, benchmark)
+                    disk_cache_hit = self.check_disk_cache(key, pruned_configs, benchmark)
                 else:
                     benchmark()
 
                 config = self.cache[key]
             else:
                 config = pruned_configs[0]
+                single_config_cache_pending = True
         else:
             config = self.cache[key]
 
@@ -2140,6 +2151,7 @@ class AutoTilingTuner(Autotuner):
         if self.print_autotuning and did_benchmark:
             print(f"Triton autotuning for function {self.base_fn.__name__} finished after "
                   f"{self.bench_time:.2f}s; best config selected: {self.best_config};")
+            self._print_benchmark_results(self.configs_timings)
 
         if did_benchmark and self.auto_profile_dir is not None:
             self._profile(*args, config=self.best_config, **kwargs)
@@ -2154,10 +2166,12 @@ class AutoTilingTuner(Autotuner):
                 *args,
                 **final_kwargs,
             )
+            if single_config_cache_pending:
+                self.cache[key] = config
             return ret
         finally:
             self.nargs = None
-            if cache_miss and not disk_cache_hit:
+            if did_benchmark and not disk_cache_hit:
                 # workaround for memory leak when some configs fail to compile
                 gc.collect()
 
@@ -2180,11 +2194,146 @@ class AutoTilingTuner(Autotuner):
             if self.print_autotuning:
                 print(f"[WARN] encounter exception when try ubtune, Details: {e}")
 
+    def _print_benchmark_results(self, timings) -> None:
+        if not self.print_autotuning:
+            return
+
+        print(f"Triton autotuning benchmark results for function {self.base_fn.__name__}:")
+        for config, timing in timings.items():
+            selected = " [selected]" if config == self.best_config else ""
+            print(f"  config={config}; {_format_autotune_timing(timing)}{selected}")
+
+    def _get_jit_compile_cache_key(self, *args, config, **meta):
+        """Return the JIT compilation identity for one autotune Config.
+
+        The autotune tuning key intentionally does not participate in this
+        identity.  If a changed tuning key produces the same JIT
+        specialization and backend options, a previous deterministic compile
+        failure can be reused safely.  If constexpr values or compile options
+        change, ``compute_cache_key`` returns a different identity and the
+        Config is compiled again.
+
+        User hooks may mutate arguments before JIT specialization, so use a
+        conservative fallback and disable negative caching for those Configs.
+        """
+        if config.pre_hook is not None or getattr(self, "user_defined_pre_hook", False):
+            return None
+
+        try:
+            current = dict(meta, **config.all_kwargs())
+            ub_cfg = dict(getattr(config, "ubtune_cfg", {}))
+            if ub_cfg:
+                current.update(ub_cfg)
+            _inject_default_simt_stack_limit(current, self.simt_stack_limit)
+
+            # Match the first call made by _batch_bench. Heuristics.run sees
+            # grid and warmup before forwarding the remaining arguments to
+            # JITFunction.run, so resolve heuristics before removing them.
+            current["warmup"] = bool(getattr(self, "compile_parallel", False))
+            jit_fn = getattr(self, "fn", None)
+            visited = set()
+            while isinstance(jit_fn, triton.runtime.Heuristics):
+                if id(jit_fn) in visited:
+                    return None
+                visited.add(id(jit_fn))
+                for name, heuristic in jit_fn.values.items():
+                    heuristic_args = {**dict(zip(jit_fn.arg_names, args)), **current}
+                    current[name] = heuristic(heuristic_args)
+                jit_fn = jit_fn.fn
+
+            # Unknown wrappers may transform arguments before JITFunction.run.
+            # Never bypass them when constructing a negative-cache key.
+            if not isinstance(jit_fn, triton.runtime.JITFunction):
+                return None
+            if getattr(jit_fn, "pre_run_hooks", None):
+                return None
+
+            # These two arguments are consumed by JITFunction.run and are not
+            # passed to the generated binder.
+            current.pop("grid", None)
+            current.pop("warmup", None)
+
+            # Keep this in sync with JITFunction.run before it invokes binder.
+            current["debug"] = current.get("debug", jit_fn.debug) or knobs.runtime.debug
+            current["instrumentation_mode"] = knobs.compilation.instrumentation_mode
+
+            device = triton.runtime.driver.active.get_current_device()
+            _, kernel_key_cache, target, _, binder = jit_fn.device_caches[device]
+            _, specialization, options = binder(*args, **current)
+            jit_key = compute_cache_key(kernel_key_cache, specialization, options)
+
+            env_vars = get_cache_invalidating_env_vars()
+            ubtuner_mode = os.environ.get("TRITON_ENABLE_UBTUNER", "")
+            if ubtuner_mode:
+                env_vars["TRITON_ENABLE_UBTUNER"] = ubtuner_mode
+
+            return (
+                jit_fn.cache_key,
+                repr(target),
+                str(sorted(env_vars.items())),
+                device,
+                jit_key,
+            )
+        except Exception:
+            # Failure-key calculation must never break normal autotuning.
+            return None
+
+    def _get_cached_compile_failure(self, compile_key):
+        if compile_key is None:
+            return None
+        with self._compile_failure_cache_lock:
+            return self._compile_failure_cache.get(compile_key)
+
+    def _remember_compile_failure(self, compile_key, exc) -> None:
+        if compile_key is None:
+            return
+        failure = {
+            "exception_type": type(exc).__name__,
+        }
+        with self._compile_failure_cache_lock:
+            self._compile_failure_cache.setdefault(compile_key, failure)
+
+    def _filter_cached_compile_failures(self, *args, configs, **kwargs):
+        active_configs = []
+        cached_configs = []
+        compile_keys = {}
+
+        for config in configs:
+            compile_key = self._get_jit_compile_cache_key(*args, config=config, **kwargs)
+            compile_keys[config] = compile_key
+            failure = self._get_cached_compile_failure(compile_key)
+            if failure is None:
+                active_configs.append(config)
+                continue
+
+            cached_configs.append(config)
+            if self.print_autotuning:
+                print("Triton autotuning: skip cached compile-failed config "
+                      f"{config}; previous failure: {failure['exception_type']}")
+
+        self._cached_compile_failed_configs = cached_configs
+        return active_configs, compile_keys
+
     def _batch_bench(self, *args, configs, **kwargs):
         from triton.compiler.errors import CompileTimeAssertionFailure, MLIRCompilationError
         from triton.runtime.errors import OutOfResources
 
         kernels_call = {config: self._make_kernel_call(*args, config=config, **kwargs) for config in configs}
+        active_configs, compile_keys = self._filter_cached_compile_failures(
+            *args,
+            configs=configs,
+            **kwargs,
+        )
+        kernels_call = {config: kernels_call[config] for config in active_configs}
+
+        if not kernels_call:
+            details = []
+            for config in configs:
+                failure = self._get_cached_compile_failure(compile_keys.get(config))
+                if failure is not None:
+                    details.append(f"config={config}: {failure['exception_type']}")
+            raise RuntimeError("All triton configs are cached compile failures.\n" + "\n".join(details))
+
         run_fns = {}
         self._compile_failed_configs = []
         exc = None
@@ -2210,12 +2359,14 @@ class AutoTilingTuner(Autotuner):
                             if hasattr(fut, "packed_metadata"):
                                 kernels_call[config].target_kernel_name = fut.packed_metadata.get("kernel_name")
                             run_fns[config] = functools.partial(kernels_call[config], warmup=False)
-                        except (CompileTimeAssertionFailure, MLIRCompilationError) as e:
+                        except (CompileTimeAssertionFailure, MLIRCompilationError, OutOfResources) as e:
                             import traceback
                             exc_stack = traceback.format_exc()
                             exc = e
                             self._try_ubtuner(*args, config=config, excp=e, run_fns=run_fns, **kwargs)
                             self._compile_failed_configs.append(config)
+                            if config not in run_fns:
+                                self._remember_compile_failure(compile_keys.get(config), e)
             except Exception as e:
                 # ignore exception from __exit__() of AsyncCompileMode
                 triton.runtime._async_compile.active_mode.set(None)
@@ -2232,6 +2383,8 @@ class AutoTilingTuner(Autotuner):
                     exc = e
                     self._try_ubtuner(*args, config=config, excp=e, run_fns=run_fns, **kwargs)
                     self._compile_failed_configs.append(config)
+                    if config not in run_fns:
+                        self._remember_compile_failure(compile_keys.get(config), e)
 
         if len(run_fns) == 0:
             raise RuntimeError(f"No valid triton configs. {type(exc).__name__}: {exc} \nStack trace: {exc_stack}")
@@ -2260,7 +2413,7 @@ class AutoTilingTuner(Autotuner):
                     list(run_fns.values()),
                     warmup=warmup,
                     active=active,
-                    clear_l2_cache=False,
+                    clear_l2_cache=True,
                     target_kernel_name=target_kernel_name,
                 )
                 assert len(time_cost) == len(run_fns)
@@ -2614,7 +2767,8 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
 
     If the environment variable :code:`TRITON_PRINT_AUTOTUNING` is set to
     :code:`"1"`, Triton will print a message to stdout after autotuning each
-    kernel, including the time spent autotuning and the best configuration.
+    kernel, including the benchmark timing for each valid configuration, the
+    time spent autotuning, and the best configuration.
 
     :param configs: a list of :code:`triton.Config` objects
     :type configs: list[triton.Config]

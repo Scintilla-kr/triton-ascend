@@ -438,17 +438,20 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
     # Turn off auto-blockify only for the ORDERED (token-ring) sync_block_lock:
     if re.search(SYNC_BLOCK_LOCK_REGEX, linalg) and not re.search(r"sync_block_lock_unordered", linalg):
         metadata["has_auto_blockify_blacklist_op"] = True
-    # The unordered (Bakery) discrete-mask lock cannot coexist with CV sub-tiling
-    # (auto-bind-sub-block)
+    # Mixed kernels use (block, subblock) as the unordered-lock participant
+    # identity. Pure AIV kernels keep subblock tiling disabled: they neither
+    # need it nor necessarily have the FFTS runtime resource it requires.
     has_unordered_sync_block_lock = re.search(r"sync_block_lock_unordered", linalg) is not None
     metadata["has_unordered_sync_block_lock"] = has_unordered_sync_block_lock
     if has_unordered_sync_block_lock:
-        metadata["auto_tile_and_bind_subblock"] = False
+        mix_mode = re.search(MIX_MODE_REGEX, linalg).group(1)
+        if mix_mode != "mix":
+            metadata["auto_tile_and_bind_subblock"] = False
         # One metadata cache line for runtime participant_num, plus one
         # choosing and one ticket cache line per participant. Each cache line is
         # 8 i64. This fallback is for one lock; the bishengir callback supplies
         # the exact total after lowering.
-        metadata["lock_num"] = (1 + 2 * 1024) * 8
+        metadata["sync_block_lock_layout"] = 1 << 32
         metadata["lock_init_val"] = 0
     # the mix mode is also encoded into metadata['name'] for runtime to distinguish
     metadata["mix_mode"] = re.search(MIX_MODE_REGEX, linalg).group(1)
@@ -673,6 +676,15 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += \
                 [f"--enable-mixed-cv={enable_mixed_cv}"]
 
+        enable_vf_fusion = metadata["enable_vf_fusion"]
+        if enable_vf_fusion is not None:
+            _compile_option_list += \
+                [f"--enable-vf-fusion={enable_vf_fusion}"]
+
+        enable_dynamic_cv_pipeline = metadata["enable_dynamic_cv_pipeline"]
+        if enable_dynamic_cv_pipeline == True:
+            _compile_option_list += [f"--enable-vf-operand-substitution=True"]
+
         enable_flatten = metadata["enable_flatten"]
         if enable_flatten is not None:
             _compile_option_list += \
@@ -765,7 +777,8 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             lib = ctypes.CDLL(callback_path)
             __get_metadata_attr_by_callback(lib, "_infer_task_type_function", metadata, "bs_task_type")
             __get_metadata_attr_by_callback(lib, "_infer_workspace_shape_function", metadata, "workspace_size")
-            __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_num_function", metadata, "lock_num")
+            __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_num_function", metadata,
+                                            "sync_block_lock_layout")
             __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_init_function", metadata, "lock_init_val")
 
         return Path(bin_path).read_bytes()
@@ -957,7 +970,8 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             lib = ctypes.CDLL(callback_path)
             __get_metadata_attr_by_callback(lib, "_infer_task_type_function", metadata, "bs_task_type")
             __get_metadata_attr_by_callback(lib, "_infer_workspace_shape_function", metadata, "workspace_size")
-            __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_num_function", metadata, "lock_num")
+            __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_num_function", metadata,
+                                            "sync_block_lock_layout")
             __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_init_function", metadata, "lock_init_val")
 
         return Path(bin_path).read_bytes()
@@ -1067,6 +1081,7 @@ class NPUOptions:
     tile_mix_cube_loop: int = None
     disable_auto_inject_block_sync: bool = None
     enable_mixed_cv: bool = None
+    enable_vf_fusion: bool = None
     enable_dynamic_cv_pipeline: bool = None
     enable_cube_block_merge: bool = False
     hfusion_enable_multiple_consumer_fusion: bool = False

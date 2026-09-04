@@ -41,6 +41,7 @@ namespace CVPipeline {
 
 inline constexpr llvm::StringLiteral kCoreType = "ssbuffer.core_type";
 inline constexpr llvm::StringLiteral kBlockId = "ssbuffer.block_id";
+inline constexpr llvm::StringLiteral kExternalSync = "ssbuffer.external_sync";
 inline constexpr llvm::StringLiteral kTransferId = "ssbuffer.transfer_id";
 inline constexpr llvm::StringLiteral kCubeFirst = "ssbuffer.cube_first";
 inline constexpr llvm::StringLiteral kVectorFirst = "ssbuffer.vector_first";
@@ -65,6 +66,7 @@ inline constexpr llvm::StringLiteral kIntraDeps = "ssbuffer.intraDeps";
 inline constexpr llvm::StringLiteral kMemCrossDeps = "ssbuffer.memCrossDeps";
 inline constexpr llvm::StringLiteral kDepMark = "ssbuffer.dep_mark";
 inline constexpr llvm::StringLiteral kMayNotExec = "ssbuffer.may_not_exec";
+inline constexpr llvm::StringLiteral kMayNotExecNPU = "may_not_exec";
 inline constexpr llvm::StringLiteral kIterCounter = "ssbuffer.iterCounter";
 inline constexpr llvm::StringLiteral kForMayNotExec =
     "ssbuffer.for_may_not_exec";
@@ -83,7 +85,11 @@ inline constexpr llvm::StringLiteral kTightlyCoupledBufferAttr =
     "hivm.tightly_coupled_buffer";
 inline constexpr llvm::StringLiteral kCoreTypeCube = "CUBE";
 inline constexpr llvm::StringLiteral kCoreTypeVector = "VECTOR";
+inline constexpr llvm::StringLiteral kCoreTypeCubeAndVector = "CUBE_AND_VECTOR";
 inline constexpr llvm::StringLiteral kFromMakeRange = "tt.from_make_range";
+inline constexpr llvm::StringLiteral kSubBlock = "ssbuffer.subBlock";
+inline constexpr llvm::StringLiteral kMergeComputeBlockApplied =
+    "ssbuffer.merge_compute_block_applied";
 
 inline constexpr const char *ERRCODE_ATTR =
     "triton_ascend.dynamic_cv_pipeline.rc";
@@ -102,10 +108,10 @@ enum CoreType {
 };
 
 inline constexpr CoreType fromStrCoreType(std::string_view s) {
-  if (s == "VECTOR") {
+  if (s == std::string_view(kCoreTypeVector)) {
     return CoreType::VECTOR_ONLY;
   }
-  if (s == "CUBE") {
+  if (s == std::string_view(kCoreTypeCube)) {
     return CoreType::CUBE_ONLY;
   }
 
@@ -128,6 +134,8 @@ bool hasFallbackAttr(ModuleOp module);
 bool isScfOp(Operation *op);
 bool isOnlyDirectlyUse(Operation *preOp, Operation *nextOp,
                        const CVPipeline::MemoryDependenceGraph &memGraph);
+bool isSyncOp(Operation *op);
+bool isExternalSyncOp(Operation *op);
 
 // Wrapper around a "main loop" — either scf.for or scf.while carrying the
 // ssbuffer.main_loop attribute. Lets downstream code treat both uniformly.
@@ -168,10 +176,6 @@ inline bool isMainLoopOp(Operation *op) {
 }
 
 CoreType getCoreTypeOfSimpleOpOrCf(Operation *op);
-
-inline bool isCubeSimpleOpOrCf(Operation *op) {
-  return getCoreTypeOfSimpleOpOrCf(op) == CoreType::CUBE_ONLY;
-}
 
 inline bool isVectorSimpleOpOrCf(Operation *op) {
   return getCoreTypeOfSimpleOpOrCf(op) == CoreType::VECTOR_ONLY;
@@ -265,15 +269,17 @@ int getLoopCarriedArgIndex(Value operand, Block *block);
 inline llvm::StringRef coreTypeToString(CoreType ct) {
   switch (ct) {
   case CUBE_ONLY:
-    return "CUBE";
+    return kCoreTypeCube;
   case VECTOR_ONLY:
-    return "VECTOR";
+    return kCoreTypeVector;
   case CUBE_AND_VECTOR:
-    return "CUBE_AND_VECTOR";
+    return kCoreTypeCubeAndVector;
   default:
     return "UNDETERMINED";
   }
 }
+
+CoreType getValueCoreType(Value value);
 
 inline OpOperand *getTiedYieldOperand(Value value, Block *block) {
   int argIdx = getLoopCarriedArgIndex(value, block);
