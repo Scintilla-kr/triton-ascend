@@ -23,6 +23,7 @@
 #include "TritonToGraph/GraphOptimizationContext.h"
 #include "TritonToGraph/GraphOptimizationRule.h"
 #include "TritonToGraph/Passes.h"
+#include "Utils/Utils.h"
 
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/PatternMatch.h"
@@ -100,7 +101,7 @@ public:
     this->ruleMask = options.enabledRuleMask;
     this->maxRewritesPerFunction = options.maxRewritesPerFunction;
     this->ubCapacityBytes = options.ubCapacityBytes;
-    this->forceSimtOnly = options.forceSimtOnly;
+    this->compileMode = options.compileMode;
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -141,10 +142,16 @@ GraphOptimizePass::getStableOptions(GraphOptimizationOptions &options) {
     return failure();
   }
 
+  if (!triton::ascend::parseCompileMode(this->compileMode)) {
+    getOperation().emitError()
+        << "graph-optimize compile-mode is invalid: " << this->compileMode;
+    return failure();
+  }
+
   options.enabledRuleMask = static_cast<uint16_t>(cliRuleMask);
   options.maxRewritesPerFunction = static_cast<unsigned>(cliMaxRewrites);
   options.ubCapacityBytes = static_cast<unsigned>(cliUBCapacityBytes);
-  options.forceSimtOnly = this->forceSimtOnly;
+  options.compileMode = this->compileMode;
   return success();
 }
 
@@ -224,8 +231,14 @@ void GraphOptimizePass::runOnOperation() {
         for (std::unique_ptr<RewritePlan> &plan : plans) {
           if (plan->getCreationEpoch() != context.getEpoch())
             continue;
-          if (failed(plan->revalidate(context)))
+          if (failed(plan->revalidate(context))) {
+            LLVM_DEBUG(
+                llvm::dbgs()
+                << "[" DEBUG_TYPE "] dropped stale graph optimization rule "
+                << static_cast<unsigned>(plan->getRuleId()) << " ("
+                << getGraphOptimizationRuleName(plan->getRuleId()) << ")\n");
             continue;
+          }
 
           selectedPlan = std::move(plan);
           break;
@@ -384,7 +397,9 @@ void populateBuiltinGraphOptimizationRules(
                     GraphOptimizationRuleId::StoreCoalescing)) {
     rules.push_back(createStoreCoalescingRule(options.ubCapacityBytes));
   }
-  if (options.forceSimtOnly &&
+  const auto compileMode =
+      triton::ascend::parseCompileMode(options.compileMode);
+  if (compileMode && *compileMode == triton::ascend::CompileMode::SimtOnly &&
       isRuleEnabled(options.enabledRuleMask,
                     GraphOptimizationRuleId::RowCoalescing)) {
     rules.push_back(createRowCoalescingRule());
