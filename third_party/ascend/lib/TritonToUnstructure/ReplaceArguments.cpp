@@ -182,9 +182,6 @@ shouldPreserveScalarPointers(Operation *op, RewriterBase &rewriter,
     for (Value arg : whileOp.getAfterArguments())
       if (!canRewriteBoundary(arg, /*allowStableBase=*/false))
         return true;
-    for (Value value : whileOp.getYieldOp().getOperands())
-      if (isOpaqueScalarPointerIfResult(value))
-        return true;
     return false;
   } else if (auto loopOp = dyn_cast<LoopLikeOpInterface>(op)) {
     for (Value init : loopOp.getInits())

@@ -53,6 +53,8 @@ using namespace mlir::triton;
 using namespace mlir::CVPipeline;
 
 // Attribute name constants
+static constexpr const char *ssbufferCoreTypeCubeAttr = "CUBE";
+static constexpr const char *ssbufferCoreTypeVectorAttr = "VECTOR";
 static constexpr int ND_SHAPE_LENGTH = 2;
 static constexpr int SHAPE_1D_LENGTH = 1;
 static constexpr int constantIntType = 32;
@@ -179,7 +181,7 @@ bool DataDependencyAnalysisPass::isAllTransposedInVector(mlir::Value value) {
   if (!isa<linalg::TransposeOp>(userOp))
     return false;
   for (mlir::Operation *transposeOpUser : userOp->getUsers()) {
-    if (getSsbufferCoreType(transposeOpUser) != CVPipeline::kCoreTypeVector)
+    if (getSsbufferCoreType(transposeOpUser) != ssbufferCoreTypeVectorAttr)
       return false;
   }
   return true;
@@ -270,7 +272,7 @@ void DataDependencyAnalysisPass::collectBlockInfo(
   // In cases with one or more core_types
   // as long as there is a cube, it is necessary to check the dataflow.
   StringRef coreType = getSsbufferCoreType(ops[0]);
-  if (coreType.contains(CVPipeline::kCoreTypeCube)) {
+  if (coreType.contains(ssbufferCoreTypeCubeAttr)) {
     blockInfo.isCube = true;
   }
 
@@ -346,7 +348,7 @@ mlir::Operation *DataDependencyAnalysisPass::createBlockInfoConstOp(
 
   BlockInfo blockInfo;
   blockInfo.blockId = newId;
-  blockInfo.isCube = (coreType == CVPipeline::kCoreTypeCube);
+  blockInfo.isCube = (coreType == ssbufferCoreTypeCubeAttr);
   blockInfo.isControl = false;
   blockInfo.Operations.push_back(constOp);
   info.getBlockInfoMap()[newId] = blockInfo;
@@ -436,9 +438,9 @@ void DataDependencyAnalysisPass::insertProducerAndRecordDeps(
     }
     // Determine dependency type based on initCoreType
     DependencyType depType;
-    if (initCoreType == CVPipeline::kCoreTypeVector) {
+    if (initCoreType == ssbufferCoreTypeVectorAttr) {
       depType = DependencyType::VectorToCube;
-    } else if (initCoreType == CVPipeline::kCoreTypeCube) {
+    } else if (initCoreType == ssbufferCoreTypeCubeAttr) {
       depType = DependencyType::CubeToVector;
     }
 
@@ -453,8 +455,8 @@ void DataDependencyAnalysisPass::insertProducerAndRecordDeps(
     LOG_DEBUG("Recorded iterArg dependency: "
               << initCoreType << " -> "
               << (depType == DependencyType::VectorToCube
-                      ? CVPipeline::kCoreTypeCube
-                      : CVPipeline::kCoreTypeVector)
+                      ? ssbufferCoreTypeCubeAttr
+                      : ssbufferCoreTypeVectorAttr)
               << ", producerBlockId=" << newId
               << ", consumerBlockId=" << userBlockId << "\n");
   }
@@ -482,9 +484,9 @@ void DataDependencyAnalysisPass::insertConsumerAndRecordDeps(
   int yieldedDefBlockId = *yieldedDefBlockIdOpt;
 
   DependencyType depType;
-  if (initCoreType == CVPipeline::kCoreTypeVector) {
+  if (initCoreType == ssbufferCoreTypeVectorAttr) {
     depType = DependencyType::CubeToVector;
-  } else if (initCoreType == CVPipeline::kCoreTypeCube) {
+  } else if (initCoreType == ssbufferCoreTypeCubeAttr) {
     depType = DependencyType::VectorToCube;
   }
 
@@ -529,9 +531,9 @@ void DataDependencyAnalysisPass::recordInitValueDeps(
   int loopBlockId = *loopBlockIdOpt;
 
   DependencyType depType;
-  if (yieldCoreType == CVPipeline::kCoreTypeVector) {
+  if (yieldCoreType == ssbufferCoreTypeVectorAttr) {
     depType = DependencyType::CubeToVector;
-  } else if (yieldCoreType == CVPipeline::kCoreTypeCube) {
+  } else if (yieldCoreType == ssbufferCoreTypeCubeAttr) {
     depType = DependencyType::VectorToCube;
   }
 
@@ -728,7 +730,7 @@ void DataDependencyAnalysisPass::analyzeExternalInputs(
       }
 
       // Case 1: Cube -> C->C dependency
-      if (coreType == CVPipeline::kCoreTypeCube) {
+      if (coreType == ssbufferCoreTypeCubeAttr) {
         LOG_DEBUG("Found external input with CUBE core type: " << input
                                                                << "\n");
         auto producerIdOpt = CVPipeline::getOpBlockId(input.getDefiningOp());
@@ -746,7 +748,7 @@ void DataDependencyAnalysisPass::analyzeExternalInputs(
         continue;
       }
       // Case 2: Vector -> V->C dependency
-      if (coreType == CVPipeline::kCoreTypeVector) {
+      if (coreType == ssbufferCoreTypeVectorAttr) {
         LOG_DEBUG("Found external input with VECTOR core type: " << input
                                                                  << "\n");
         auto producerIdOpt = CVPipeline::getOpBlockId(input.getDefiningOp());
@@ -795,7 +797,7 @@ void DataDependencyAnalysisPass::analyzeExternalOutputs(
       unsigned resultIndex = opResult.getResultNumber();
       StringRef resultCoreType =
           getCoreTypeWithIndex(output.getDefiningOp(), resultIndex);
-      if (resultCoreType != CVPipeline::kCoreTypeCube) {
+      if (resultCoreType != ssbufferCoreTypeCubeAttr) {
         continue;
       }
 
@@ -822,7 +824,7 @@ void DataDependencyAnalysisPass::analyzeExternalOutputs(
               "Warning: [c->v] Input value has no core type attribute.\n");
           continue;
         }
-        if (userCoreType == CVPipeline::kCoreTypeVector) {
+        if (userCoreType == ssbufferCoreTypeVectorAttr) {
           LOG_DEBUG("Found external output used by VECTOR core type: " << output
                                                                        << "\n");
           auto consumerIdOpt = CVPipeline::getOpBlockId(user);
@@ -856,9 +858,9 @@ void DataDependencyAnalysisPass::collectMemDepInfo(
     mlir::Operation *predOp, mlir::Operation *nextOp) {
   DependencyInfo depInfo;
 
-  if (predCoreType == CVPipeline::kCoreTypeCube) {
+  if (predCoreType == ssbufferCoreTypeCubeAttr) {
     depInfo.type = DependencyType::CubeToVector;
-  } else if (predCoreType == CVPipeline::kCoreTypeVector) {
+  } else if (predCoreType == ssbufferCoreTypeVectorAttr) {
     depInfo.type = DependencyType::VectorToCube;
   }
   depInfo.producerBlockId = producerBlockId;

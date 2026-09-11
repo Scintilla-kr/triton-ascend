@@ -479,15 +479,14 @@ bool FixpipeOptPass::applyFixpipeOpt(
           return WalkResult::advance();
         }
         bm.updateBlockId(nestedOp, targetBlockId);
-        nestedOp->setAttr(
-            CVPipeline::kCoreType,
-            StringAttr::get(op->getContext(), CVPipeline::kCoreTypeCube));
+        nestedOp->setAttr(CVPipeline::kCoreType,
+                          StringAttr::get(op->getContext(), "CUBE"));
         return WalkResult::advance();
       });
     } else {
       bm.updateBlockId(op, targetBlockId);
       op->setAttr(CVPipeline::kCoreType,
-                  StringAttr::get(op->getContext(), CVPipeline::kCoreTypeCube));
+                  StringAttr::get(op->getContext(), "CUBE"));
     }
   }
   return true;

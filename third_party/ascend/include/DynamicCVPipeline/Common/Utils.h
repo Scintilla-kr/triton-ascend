@@ -85,7 +85,6 @@ inline constexpr llvm::StringLiteral kTightlyCoupledBufferAttr =
     "hivm.tightly_coupled_buffer";
 inline constexpr llvm::StringLiteral kCoreTypeCube = "CUBE";
 inline constexpr llvm::StringLiteral kCoreTypeVector = "VECTOR";
-inline constexpr llvm::StringLiteral kCoreTypeCubeAndVector = "CUBE_AND_VECTOR";
 inline constexpr llvm::StringLiteral kFromMakeRange = "tt.from_make_range";
 inline constexpr llvm::StringLiteral kSubBlock = "ssbuffer.subBlock";
 inline constexpr llvm::StringLiteral kMergeComputeBlockApplied =
@@ -95,6 +94,8 @@ inline constexpr const char *ERRCODE_ATTR =
     "triton_ascend.dynamic_cv_pipeline.rc";
 static constexpr const int ERRCODE_FAILED = 1;
 static constexpr const int ERRCODE_IGNORED = 2;
+static constexpr const int ERRCODE_TUPLE_PRELOAD_FAILED = 3;
+static constexpr const int ERRCODE_DISABLE_VF_SUBSTITUTION = 4;
 constexpr int64_t CACHE_TABLE_BUFFER_SIZE = 4096;
 constexpr int64_t BYTE_SIZE = 8;
 static constexpr int crossCoreProducerId = 1;
@@ -108,10 +109,10 @@ enum CoreType {
 };
 
 inline constexpr CoreType fromStrCoreType(std::string_view s) {
-  if (s == std::string_view(kCoreTypeVector)) {
+  if (s == "VECTOR") {
     return CoreType::VECTOR_ONLY;
   }
-  if (s == std::string_view(kCoreTypeCube)) {
+  if (s == "CUBE") {
     return CoreType::CUBE_ONLY;
   }
 
@@ -269,11 +270,11 @@ int getLoopCarriedArgIndex(Value operand, Block *block);
 inline llvm::StringRef coreTypeToString(CoreType ct) {
   switch (ct) {
   case CUBE_ONLY:
-    return kCoreTypeCube;
+    return "CUBE";
   case VECTOR_ONLY:
-    return kCoreTypeVector;
+    return "VECTOR";
   case CUBE_AND_VECTOR:
-    return kCoreTypeCubeAndVector;
+    return "CUBE_AND_VECTOR";
   default:
     return "UNDETERMINED";
   }

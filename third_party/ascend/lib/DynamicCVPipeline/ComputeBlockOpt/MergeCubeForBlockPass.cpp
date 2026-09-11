@@ -59,7 +59,7 @@ static bool isCubeForOp(scf::ForOp forOp) {
     return false;
   }
   for (llvm::StringRef part : parts) {
-    if (part.trim() != CVPipeline::kCoreTypeCube) {
+    if (part.trim() != "CUBE") {
       return false;
     }
   }
@@ -118,7 +118,7 @@ static void applyMerge(scf::ForOp forOp, int target,
     if (CVPipeline::getOpBlockId(op).has_value()) {
       bm.updateBlockId(op, target);
       op->setAttr(CVPipeline::kCoreType,
-                  StringAttr::get(op->getContext(), CVPipeline::kCoreTypeCube));
+                  StringAttr::get(op->getContext(), "CUBE"));
     }
   });
 }

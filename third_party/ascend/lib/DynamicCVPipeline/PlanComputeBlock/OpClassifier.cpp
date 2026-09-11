@@ -90,11 +90,11 @@ std::string OpClassifierPass::describeOp(Operation *op) const {
 std::string coreTypeToString(OpCoreType ct) {
   switch (ct) {
   case OP_CUBE_ONLY:
-    return CVPipeline::kCoreTypeCube.str();
+    return "CUBE";
   case OP_VECTOR_ONLY:
-    return CVPipeline::kCoreTypeVector.str();
+    return "VECTOR";
   case OP_CUBE_AND_VECTOR:
-    return CVPipeline::kCoreTypeCubeAndVector.str();
+    return "CUBE_AND_VECTOR";
   default:
     return "UNDETERMINED";
   }
@@ -124,11 +124,11 @@ OpCoreType parseCoreTypeFromString(const std::string &coreTypeStr,
     return parseCoreTypeFromString(parts[index].str());
   }
   StringRef singleValue = parts[0].trim();
-  if (singleValue == CVPipeline::kCoreTypeCube) {
+  if (singleValue == "CUBE") {
     return OP_CUBE_ONLY;
-  } else if (singleValue == CVPipeline::kCoreTypeVector) {
+  } else if (singleValue == "VECTOR") {
     return OP_VECTOR_ONLY;
-  } else if (singleValue == CVPipeline::kCoreTypeCubeAndVector) {
+  } else if (singleValue == "CUBE_AND_VECTOR") {
     return OP_CUBE_AND_VECTOR;
   }
   return OP_UNDETERMINED;
@@ -1435,10 +1435,9 @@ void OpClassifierPass::processYieldOperation(Operation *op,
     op->setAttr("ssbuffer.core_type",
                 StringAttr::get(op->getContext(), coreTypeStr));
 
-    OpCoreType opCt =
-        (coreTypeStr.find(CVPipeline::kCoreTypeCube) != std::string::npos)
-            ? OP_CUBE_ONLY
-            : OP_VECTOR_ONLY;
+    OpCoreType opCt = (coreTypeStr.find("CUBE") != std::string::npos)
+                          ? OP_CUBE_ONLY
+                          : OP_VECTOR_ONLY;
     opCoreTypes[op] = opCt;
 
     if (parentOp && llvm::isa<scf::SCFDialect>(parentOp->getDialect())) {
