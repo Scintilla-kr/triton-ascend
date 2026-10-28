@@ -22,6 +22,7 @@
 
 #ifndef ADD_AUTO_SCHEDULING_COMMON_UTILS_H
 #define ADD_AUTO_SCHEDULING_COMMON_UTILS_H
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -60,6 +61,7 @@ inline constexpr llvm::StringLiteral kLoadStoreBufCount =
     "ssbuffer.load_store_buf_count";
 inline constexpr llvm::StringLiteral kAnalyzeFlagId =
     "ssbuffer.analyze_flag_id";
+inline constexpr llvm::StringLiteral kLoopId = "ssbuffer.loop_id";
 inline constexpr llvm::StringLiteral kLoopCarriedL0C =
     "ssbuffer.loop_carried_l0c";
 inline constexpr llvm::StringLiteral kCrossCoreDeps = "ssbuffer.crossCoreDeps";
@@ -322,6 +324,17 @@ inline bool isTensorComputeOp(Operation *op) {
   }
 
   return false;
+}
+
+// Arithmetic/reduction on tensors. isTensorComputeOp already drops
+// copy/broadcast/fill. Transpose is only a permutation, and arith.select is
+// control-flow glue around ssbuffer.splitted_if, so neither counts.
+inline bool isRealTensorComputeOp(Operation *op) {
+  if (!isTensorComputeOp(op))
+    return false;
+  if (isa<linalg::TransposeOp, arith::SelectOp>(op))
+    return false;
+  return true;
 }
 
 // Determine FixpipePreQuantMode from a trunc op.
