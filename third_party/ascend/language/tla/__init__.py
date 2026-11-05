@@ -27,27 +27,162 @@ from the TLA repo's SIMD VF additions.  It does **not** reuse the existing
 Exports: ``alloc_buffer``/``alloc`` (on-chip buffer + versions),
 ``copy`` (GM<->buffer), ``view`` (GM view), ``scope`` (core-mode scopes:
 ``tla.scope.simd()`` / ``tla.scope.cube()``),
-``simd`` (vector-register ops), ``annotate_buffer_versions``.
+``simd`` (vector-register ops), ``where`` (eager scalar/SIMD select),
+``annotate_buffer_versions``, and scalar dtypes.
+
+Scalar types share Triton's dtype protocol, so ``tla.float32`` can be passed
+directly to buffer, vector, and cast APIs.  The re-exported names map to the
+following Triton dtypes:
+
+``bfloat16`` -> ``bf16``, ``float16`` -> ``fp16``, ``float32`` -> ``fp32``,
+``int8``/``int16``/``int32``/``int64`` keep their names, and
+``uint8``/``uint16``/``uint32``/``uint64`` keep their names.  The ``dtype``
+constructor uses Triton's canonical names (for example, ``dtype("fp32")``).
+
+.. note::
+    The scalar dtype objects are re-exported unchanged from
+    :mod:`triton.language.core`; they are the same objects as
+    ``triton.language.float32`` and the other public dtype names.
 """
+
+# Re-export Triton's scalar dtype objects unchanged.  Using the original
+# objects keeps ``tla.buffer_type``, ``tla.vector_type``, casts and ``@tla.jit``
+# interoperable with ``triton.language`` without wrappers or conversions.
+# These are dtype objects, not functions; their public spellings are the
+# Triton names above, while ``tla.dtype(...)`` accepts canonical names such as
+# ``"fp32"``.
+from triton.language.core import (
+    bfloat16,
+    dtype,
+    float16,
+    float32,
+    int8,
+    int16,
+    int32,
+    int64,
+    uint8,
+    uint16,
+    uint32,
+    uint64,
+)
 
 from .core import buffer, buffer_type, vector, vector_type
 from .scope import scope
 from .alloc import alloc_buffer, alloc
 from .copy import copy
-from .view import view, reshape
-from .aux_ops import annotate_buffer_versions
+from .dma import (
+    PadMode,
+    EvictionPolicy,
+    AtomicKind,
+    UnitFlagMode,
+    FixpipeDMAMode,
+    FixpipeDualDstMode,
+    FixpipeSubBlock,
+    FixpipePreQuantMode,
+    FixpipePreReluMode,
+    LoadGM2UBParams,
+    StoreUB2GMParams,
+    LoadGM2L1Params,
+    CopyUB2L1Params,
+    CopyL12UBParams,
+    CopyL12BTParams,
+    CopyL12FBParams,
+    CopyL1ToL0Params,
+    FixpipeL0C2GMParams,
+    FixpipeL0C2L1Params,
+    FixpipeL0C2UBParams,
+    load_gm_to_ub,
+    store_ub_to_gm,
+    load_gm_to_l1,
+    copy_ub_to_l1,
+    copy_l1_to_ub,
+    copy_l1_to_bt,
+    copy_l1_to_fb,
+    copy_l1_to_l0,
+    store_l0c_to_gm,
+    copy_l0c_to_ub,
+    copy_l0c_to_l1,
+    set_ctrl,
+)
+
+from .view import view, subview, reshape
+from .aux_ops import annotate_buffer_versions, assume
+
 from . import math
-from .math import compensated_rstd
-from .device_assert import device_assert
+from .math import compensated_rstd, truncmod
+from .debug import device_assert, device_print
 
 # SIMD vector-register ops.  ``simd`` is exported as a module so its ``cast``
 # (ave.hir.vextf) does not shadow unrelated top-level names.
 from . import simd
 
+# Scalar / SIMD-register selection (eager, unlike TileLang T.if_then_else).
+from .selection import where
+
 # Cube-core ops (``mmad``/``tla.copy`` L1/L0C routes).
 from . import cube
 
+# Explicit pipeline / global synchronization.
+from . import sync
+from .sync import sub_block_id
+
+
+def jit(fn=None, **kwargs):
+    """``@tla.jit``: like ``triton.jit``, but lowered via the TLA frontend."""
+    from .jit import TLAJITFunction
+
+    def decorator(f):
+        return TLAJITFunction(f, **kwargs)
+
+    return decorator(fn) if fn is not None else decorator
+
+
 __all__ = [
+    # scalar dtypes (shared with triton.language)
+    "bfloat16",
+    "dtype",
+    "float16",
+    "float32",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "PadMode",
+    "EvictionPolicy",
+    "AtomicKind",
+    "UnitFlagMode",
+    "FixpipeDMAMode",
+    "FixpipeDualDstMode",
+    "FixpipeSubBlock",
+    "FixpipePreQuantMode",
+    "FixpipePreReluMode",
+    "LoadGM2UBParams",
+    "StoreUB2GMParams",
+    "LoadGM2L1Params",
+    "CopyUB2L1Params",
+    "CopyL12UBParams",
+    "CopyL12BTParams",
+    "CopyL12FBParams",
+    "CopyL1ToL0Params",
+    "FixpipeL0C2GMParams",
+    "FixpipeL0C2L1Params",
+    "FixpipeL0C2UBParams",
+    "load_gm_to_ub",
+    "store_ub_to_gm",
+    "load_gm_to_l1",
+    "copy_ub_to_l1",
+    "copy_l1_to_ub",
+    "copy_l1_to_bt",
+    "copy_l1_to_fb",
+    "copy_l1_to_l0",
+    "store_l0c_to_gm",
+    "copy_l0c_to_ub",
+    "copy_l0c_to_l1",
+    "set_ctrl",
     "buffer",
     "buffer_type",
     "vector",
@@ -58,6 +193,7 @@ __all__ = [
     "alloc",
     "copy",
     "view",
+    "subview",
     "reshape",
 
     # core-mode scopes (scope.simd / scope.cube)
@@ -66,14 +202,27 @@ __all__ = [
     # math helpers / diagnostics
     "math",
     "compensated_rstd",
+    "truncmod",
     "device_assert",
+    "device_print",
 
     # aux ops
     "annotate_buffer_versions",
+    "assume",
 
     # simd ops
     "simd",
 
+    # scalar / SIMD selection
+    "where",
+
     # cube ops
     "cube",
+
+    # explicit synchronization
+    "sync",
+    "sub_block_id",
+
+    # kernel decorator
+    "jit",
 ]

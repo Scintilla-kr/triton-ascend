@@ -68,7 +68,7 @@ def _vector_control_flow(out, n):
         acc = tla.simd.vfull(0.0, tl.float32, 64)
         step = tla.simd.vfull(1.0, tl.float32, 64)
         for i in range(n):
-            acc, mask = tla.simd.vadd(acc, step), tla.simd.vcmp(acc, step, "ge")
+            acc, mask = tla.simd.vadd(acc, step), tla.simd.vcmp(acc, step, op=tla.simd.CMP.GE)
             acc = tla.simd.vsel(mask, acc, step)
         pair = (acc, step)
         for i in range(n):
@@ -90,6 +90,57 @@ def _vector_control_flow(out, n):
         lo, hi = tla.simd.vdintlv(lo, hi)
         acc = tla.simd.vreduce_max([lo, hi])
         tla.simd.vsts(out[0], acc)
+
+
+@tr.jit
+def _scalar_where(out, cond):
+    with tla.scope.simd():
+        base = tla.where(cond, 0, 32)  # scalar int1 cond -> arith.select
+        tla.simd.vsts(out[0], tla.simd.vci(base), dist="NORM_B32")
+
+
+@tr.jit
+def _scalar_truncmod(out, a, b, DTYPE: tl.constexpr):
+    rem = tla.truncmod(a, b)
+    with tla.scope.simd():
+        tla.simd.vsts(out[0], tla.simd.vdup(rem, DTYPE), dist="NORM_B32")
+
+
+def test_truncmod_scalar_ir(output_dir=None):
+    for kind, dtype, op in (("i32", tl.int32, "arith.remsi"), ("u32", tl.uint32, "arith.remui")):
+        module, ctx = compile_offline(_scalar_truncmod, {
+            "out": tla.buffer_type((64, ), dtype, "ub"),
+            "a": kind,
+            "b": kind,
+        }, {"DTYPE": dtype}, output_dir)
+        text = str(module)
+        assert op in text, text
+        assert "tensor<" not in text, text
+        lower_offline(module, ctx, output_dir)
+
+
+def test_scalar_where_ir(output_dir=None):
+    # vci materializes an i32 vector, so the UB view must be int32 (f32 here
+    # made the vsts dtype mismatch).
+    module, ctx = compile_offline(_scalar_where, {"out": tla.buffer_type((64, ), tl.int32, "ub"), "cond": "i1"}, {},
+                                  output_dir)
+    text = str(module)
+    assert "arith.select" in text, text
+    assert "tensor<" not in text
+    lower_offline(module, ctx, output_dir)
+
+
+@tr.jit
+def _scalar_assume(cond):
+    tla.assume(cond)
+
+
+def test_assume_scalar_ir(output_dir=None):
+    module, ctx = compile_offline(_scalar_assume, {"cond": "i1"}, {}, output_dir)
+    text = str(module)
+    assert "llvm.intr.assume" in text, text
+    lowered = lower_offline(module, ctx, output_dir)
+    assert "llvm.intr.assume" in str(lowered), str(lowered)
 
 
 def test_ir(output_dir=None):

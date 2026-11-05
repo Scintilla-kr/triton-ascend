@@ -19,6 +19,7 @@
 # THE SOFTWARE.
 """pytest glue for tla_ut: map TLA_TEST_STAGE onto skips, provide fixtures."""
 import os
+from pathlib import Path
 import sys
 
 import pytest
@@ -29,12 +30,13 @@ from utils.tla_test_utils import get_stages, npu_available
 
 
 @pytest.fixture(scope="session", autouse=True)
-def assign_npu(worker_id):
+def assign_npu(request):
     """One NPU per xdist worker; no-op when no device (ir-only mode)."""
     if not npu_available():
         return
     import torch
 
+    worker_id = request.getfixturevalue("worker_id") if request.config.pluginmanager.hasplugin("xdist") else "master"
     npu_id = 0 if worker_id == "master" else int(worker_id[2:]) % torch.npu.device_count()
     torch.npu.set_device(npu_id)
 
@@ -45,11 +47,17 @@ def output_dir():
     return None
 
 
+@pytest.hookimpl(wrapper=True)
 def pytest_collect_file(file_path, parent):
-    """Collect every *.py as a test module (cases are named by op, not test_*)."""
+    """Extend normal collection to op-named files without collecting modules twice."""
+    collectors = yield
+    # Composite kernels load device code lazily; only collect their test modules.
+    if Path(__file__).parent / "kernels" in file_path.parents and not file_path.name.startswith("test_"):
+        return []
     if file_path.suffix == ".py" and file_path.name != "conftest.py":
-        return pytest.Module.from_parent(parent, path=file_path)
-    return None
+        if not any(isinstance(collector, pytest.Module) for collector in collectors):
+            collectors.append(pytest.Module.from_parent(parent, path=file_path))
+    return collectors
 
 
 def pytest_collection_modifyitems(config, items):
@@ -57,5 +65,6 @@ def pytest_collection_modifyitems(config, items):
     stage = os.environ.get("TLA_TEST_STAGE", "all")
     enabled = {"test_compile": do_compile, "test_run": do_run}
     for item in items:
-        if not enabled.get(item.name, True):
+        # Parametrized item.name includes [case]; stage selection uses the function name.
+        if not enabled.get(getattr(item, "originalname", item.name), True):
             item.add_marker(pytest.mark.skip(reason=f"{item.name} skipped (TLA_TEST_STAGE={stage})"))

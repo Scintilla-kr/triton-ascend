@@ -26,7 +26,6 @@ import builtins
 import copy
 import functools
 import ast
-import gc
 import inspect
 import math
 import os
@@ -2334,9 +2333,6 @@ class AutoTilingTuner(Autotuner):
             raise
         finally:
             self.nargs = None
-            if did_benchmark and not disk_cache_hit:
-                # workaround for memory leak when some configs fail to compile
-                gc.collect()
 
     def _try_ubtuner(self, *args, config, excp, run_fns, **kwargs):
         if not (self.enable_ubtuner and "ub overflow" in str(excp).lower()):
@@ -2540,7 +2536,7 @@ class AutoTilingTuner(Autotuner):
             try:
                 with (
                         ThreadPoolExecutor(max_workers=max_workers) as executor,
-                        triton.AsyncCompileMode(executor),
+                        triton.AsyncCompileMode(executor) as mode,
                 ):
                     for config, fn in kernels_call.items():
                         self._record_user_config(config, "compiling", "Compilation did not complete.")
@@ -2575,6 +2571,25 @@ class AutoTilingTuner(Autotuner):
                         # __exit__ can re-raise an earlier future's exception;
                         # it cannot identify a failure in this pending config.
                         self._record_user_config(pending, "not_evaluated", "Parallel compilation interrupted:", exc=e)
+            finally:
+                mode_obj = locals().get("mode") if "mode" in locals() else None
+                if mode_obj is not None:
+                    for raw in mode_obj.raw_futures:
+                        e2 = getattr(raw, "_exception", None)
+                        if e2 is not None:
+                            e2.__traceback__ = None
+                            e2.__context__ = None
+                            e2.__cause__ = None
+                    for fk in mode_obj.future_kernels.values():
+                        raw = getattr(fk, "_future", None) or getattr(fk, "future", None)
+                        if raw is not None:
+                            e2 = getattr(raw, "_exception", None)
+                            if e2 is not None:
+                                e2.__traceback__ = None
+                                e2.__context__ = None
+                                e2.__cause__ = None
+                    mode_obj.raw_futures.clear()
+                    mode_obj.future_kernels.clear()
         else:
             for config, fn in kernels_call.items():
                 self._record_user_config(config, "compiling", "Compilation or initial execution did not complete.")

@@ -618,63 +618,72 @@ SelectCanonicalizer::matchAndRewrite(arith::SelectOp op,
     return success();
   }
 
-  // For Tail or Middle positions, we need to compute inverted dimensions
-  // to handle the masking logic
-  SmallVector<OpFoldResult> invertOffsets;
-  SmallVector<OpFoldResult> invertFalseDims;
-  SmallVector<OpFoldResult> invertTrueDims;
-  OpFoldResult falseDimOp;
-  OpFoldResult trueDimOp;
-  int valDim = -1;
+  // Tail/Middle masks may have a dynamic start outside the tensor. Keep the
+  // same bounds check for both target-specific slice implementations.
+  Value dynamicOffset;
+  int dynamicDim = -1;
   for (int i = 0; i < mstate.getRank(); ++i) {
-    const auto &offVal = mstate.offsets[i];
-    const auto &dimVal = mstate.dims[i];
-    auto constOffVal = getConstantIntValue(offVal);
-    invertOffsets.push_back(rewriter.getIndexAttr(0));
-    if (constOffVal.has_value() && constOffVal.value() == 0) {
-      invertFalseDims.push_back(dimVal);
-      invertTrueDims.push_back(dimVal);
-    } else {
-      assert(valDim == -1 &&
-             "The offset in only one dimension can be not zero.");
-      if (!constOffVal.has_value()) {
-        valDim = i;
-        falseDimOp = offVal;
-      }
-
-      invertFalseDims.push_back(offVal);
-      trueDimOp = addOpFoldResult(offVal, dimVal, loc, rewriter,
-                                  rewriter.getIndexType());
-      invertTrueDims.push_back(trueDimOp);
+    if (!getConstantIntValue(mstate.offsets[i]).has_value()) {
+      assert(dynamicDim == -1 &&
+             "The offset in only one dimension can be dynamic.");
+      dynamicDim = i;
+      dynamicOffset = cast<Value>(mstate.offsets[i]);
     }
   }
 
-  // Slice out the invert first masked part of false tensor
-  auto falseExtractSliceOp = mstate.getExtractSlice(
-      falseTensor, loc, rewriter, invertOffsets, invertFalseDims);
-  // Insert out the sliced false tensor into true tensor
-  auto trueInsertSliceOp =
-      mstate.getInsertSlice(falseExtractSliceOp, trueTensor, loc, rewriter,
-                            invertOffsets, invertFalseDims);
-  // Slice out the invert first masked and masked part of inserted true tensor
-  auto extractSliceOp = mstate.getExtractSlice(trueInsertSliceOp, loc, rewriter,
-                                               invertOffsets, invertTrueDims);
-  // Insert out the sliced true tensor into false tensor
-  auto insertSliceOp =
-      mstate.getInsertSlice(extractSliceOp, falseTensor, loc, rewriter,
-                            invertOffsets, invertTrueDims);
-  if (valDim != -1) {
-    rewriter.setInsertionPointAfter(trueInsertSliceOp);
-    assert(isa<Value>(falseDimOp) &&
-           "Expected to be a runtime Value for dynamic dimension check.");
+  Value sliceSource = trueTensor;
+  SmallVector<OpFoldResult> sliceOffsets(mstate.offsets);
+  SmallVector<OpFoldResult> sliceDims(mstate.dims);
+  SmallVector<Operation *> sliceOps;
+  if (!useDirectSelectSlices) {
+    // A2/A3 require the prefix reconstruction to keep all slice starts at zero.
+    // Direct dynamic starts can trigger NPU IR alignment padding and UB
+    // overflow. 950 supports unaligned UB copies and can use the original mask
+    // offsets.
+    SmallVector<OpFoldResult> invertOffsets;
+    SmallVector<OpFoldResult> invertFalseDims;
+    SmallVector<OpFoldResult> invertTrueDims;
+    for (int i = 0; i < mstate.getRank(); ++i) {
+      const auto &offset = mstate.offsets[i];
+      const auto &dim = mstate.dims[i];
+      invertOffsets.push_back(rewriter.getIndexAttr(0));
+      if (isConstantIntValue(offset, 0)) {
+        invertFalseDims.push_back(dim);
+        invertTrueDims.push_back(dim);
+      } else {
+        invertFalseDims.push_back(offset);
+        invertTrueDims.push_back(addOpFoldResult(offset, dim, loc, rewriter,
+                                                 rewriter.getIndexType()));
+      }
+    }
+
+    auto falseExtractSliceOp = mstate.getExtractSlice(
+        falseTensor, loc, rewriter, invertOffsets, invertFalseDims);
+    auto trueInsertSliceOp =
+        mstate.getInsertSlice(falseExtractSliceOp, trueTensor, loc, rewriter,
+                              invertOffsets, invertFalseDims);
+    sliceOps.push_back(falseExtractSliceOp.getOperation());
+    sliceOps.push_back(trueInsertSliceOp.getOperation());
+    sliceSource = trueInsertSliceOp;
+    sliceOffsets = std::move(invertOffsets);
+    sliceDims = std::move(invertTrueDims);
+  }
+
+  auto extractSliceOp = mstate.getExtractSlice(sliceSource, loc, rewriter,
+                                               sliceOffsets, sliceDims);
+  auto insertSliceOp = mstate.getInsertSlice(extractSliceOp, falseTensor, loc,
+                                             rewriter, sliceOffsets, sliceDims);
+  sliceOps.push_back(extractSliceOp.getOperation());
+  sliceOps.push_back(insertSliceOp.getOperation());
+  if (dynamicDim != -1) {
+    rewriter.setInsertionPointAfter(insertSliceOp);
     Value zeroIndex = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     Value isNegative = rewriter.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::slt, cast<Value>(falseDimOp), zeroIndex);
-
+        loc, arith::CmpIPredicate::slt, dynamicOffset, zeroIndex);
     Value sizeIndex =
-        rewriter.create<arith::ConstantIndexOp>(loc, tensorShape[valDim]);
+        rewriter.create<arith::ConstantIndexOp>(loc, tensorShape[dynamicDim]);
     Value isOutOfRange = rewriter.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::sge, cast<Value>(falseDimOp), sizeIndex);
+        loc, arith::CmpIPredicate::sge, dynamicOffset, sizeIndex);
     auto orOp = rewriter.create<arith::OrIOp>(loc, isNegative, isOutOfRange);
     auto ifOp = rewriter.create<scf::IfOp>(loc, TypeRange{type},
                                            orOp.getResult(), true, true);
@@ -684,27 +693,20 @@ SelectCanonicalizer::matchAndRewrite(arith::SelectOp op,
     rewriter.create<scf::YieldOp>(loc, ValueRange{falseTensor});
 
     Block *elseBlock = &ifOp.getElseRegion().front();
-    rewriter.setInsertionPointToStart(elseBlock);
-    falseExtractSliceOp->moveBefore(elseBlock, elseBlock->begin());
-    trueInsertSliceOp->moveAfter(falseExtractSliceOp);
-    extractSliceOp->moveAfter(trueInsertSliceOp);
-    insertSliceOp->moveAfter(extractSliceOp);
-
+    for (Operation *sliceOp : sliceOps)
+      sliceOp->moveBefore(elseBlock, elseBlock->end());
     rewriter.setInsertionPointAfter(insertSliceOp);
     rewriter.create<scf::YieldOp>(loc, ValueRange{insertSliceOp.getResult()});
     rewriter.replaceOp(op, ifOp);
-  } else { // static offsets
+  } else {
     rewriter.replaceOp(op, insertSliceOp);
   }
   LLVM_DEBUG({
-    llvm::dbgs() << "  -> [invert] Created false tensor extractSlice: "
-                 << *falseExtractSliceOp.getOperation() << "\n"
-                 << "  -> [invert] Created true tensor insertSlice: "
-                 << *trueInsertSliceOp.getOperation() << "\n"
-                 << "  -> [invert] Created ExtractSlice: "
-                 << *extractSliceOp.getOperation() << "\n"
-                 << "  -> [invert] Created InsertSlice: "
-                 << *insertSliceOp.getOperation() << "\n";
+    llvm::dbgs() << "  -> Created "
+                 << (useDirectSelectSlices ? "direct" : "prefix")
+                 << " select slices:\n";
+    for (Operation *sliceOp : sliceOps)
+      llvm::dbgs() << "     " << *sliceOp << "\n";
   });
   return success();
 }
@@ -2708,7 +2710,8 @@ MatmulConverter::matchAndRewrite(triton::DotOp op, OpAdaptor adaptor,
   };
 
   Operation *matmulOp;
-  if (mlir::isa<mlir::FloatType>(elemTy) && !elemTy.isF32()) {
+  if (mlir::isa<mlir::FloatType>(elemTy) &&
+      elemTy.getIntOrFloatBitWidth() < 32) {
     RankedTensorType opcFp32Ty =
         RankedTensorType::get(dstType.getShape(), rewriter.getF32Type());
     Value opcFp32 = rewriter.create<arith::ExtFOp>(op.getLoc(), opcFp32Ty, opc);
@@ -3084,12 +3087,35 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
                      rhsElemType == triton::ScaleDotElemType::E5M2);
   bool isFP4Input = (lhsElemType == triton::ScaleDotElemType::E2M1) &&
                     (rhsElemType == triton::ScaleDotElemType::E2M1);
+  if ((isFP8Input || isFP4Input) && !lhsScale) {
+    auto lhsTy = cast<RankedTensorType>(lhs.getType());
+    int64_t k = lhsTy.getShape().back();
+    if (lhsElemType == triton::ScaleDotElemType::E2M1 && op.getLhsKPack())
+      k *= 2;
+    auto defaultScaleTy = RankedTensorType::get(
+        {dstType.getDimSize(dstType.getRank() - 2), (k + 31) / 32},
+        rewriter.getI8Type());
+    // The native MX path uses E8M0, whose encoding of one is 127.
+    Value defaultScaleVal =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getI8IntegerAttr(127));
+    Value defaultScaleEmpty = rewriter.create<tensor::EmptyOp>(
+        loc, defaultScaleTy.getShape(), defaultScaleTy.getElementType());
+    lhsScale = rewriter
+                   .create<linalg::FillOp>(loc, ValueRange{defaultScaleVal},
+                                           ValueRange{defaultScaleEmpty})
+                   .getResult(0);
+  }
   if (isFP8Input || isFP4Input) {
     if (!rhsScale) {
-      RankedTensorType defaultScaleTy =
-          RankedTensorType::get({1}, rewriter.getI8Type());
-      Value defaultScaleVal =
-          rewriter.create<arith::ConstantOp>(loc, rewriter.getI8IntegerAttr(1));
+      auto rhsTy = cast<RankedTensorType>(rhs.getType());
+      int64_t k = rhsTy.getDimSize(rhsTy.getRank() - 2);
+      if (rhsElemType == triton::ScaleDotElemType::E2M1 && op.getRhsKPack())
+        k *= 2;
+      auto defaultScaleTy = RankedTensorType::get(
+          {dstType.getShape().back(), (k + 31) / 32}, rewriter.getI8Type());
+      // E8M0 encodes a scale factor of one with exponent bias 127.
+      Value defaultScaleVal = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getI8IntegerAttr(127));
       Value defaultScaleEmpty = rewriter.create<tensor::EmptyOp>(
           loc, defaultScaleTy.getShape(), defaultScaleTy.getElementType());
       rhsScale = rewriter
