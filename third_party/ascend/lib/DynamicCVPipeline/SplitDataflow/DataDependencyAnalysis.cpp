@@ -60,31 +60,6 @@ static constexpr int ND_SHAPE_LENGTH = 2;
 static constexpr int SHAPE_1D_LENGTH = 1;
 static constexpr int constantIntType = 32;
 
-// Helper: ssbuffer.core_type
-llvm::StringRef getSsbufferCoreType(Operation *op) {
-  if (auto attr = op->getAttrOfType<mlir::StringAttr>(CVPipeline::kCoreType)) {
-    return attr.getValue();
-  }
-  return "";
-}
-
-// Helper: Get CoreType from op and index
-llvm::StringRef getCoreTypeWithIndex(Operation *op, int index) {
-  llvm::StringRef typeStr = getSsbufferCoreType(op);
-  if (typeStr.contains(", ")) {
-    llvm::SmallVector<llvm::StringRef> types;
-    typeStr.split(types, ", ", -1, false);
-    if (index < types.size()) {
-      return types[index].trim();
-    }
-    LOG_DEBUG("Warning: Core type string has multiple types but value is not "
-              "an OpResult or index out of range.\n");
-    return "";
-  }
-
-  return typeStr;
-}
-
 void DataDependencyAnalysisPass::updateCoreTypeAtIndex(
     Operation *op, int index, llvm::StringRef newCoreType) {
   auto coreTypeAttr =
@@ -132,11 +107,57 @@ bool DataDependencyAnalysisPass::isControlFlowOp(mlir::Operation *op) {
          isa<scf::YieldOp, scf::ConditionOp>(op);
 }
 
+bool DataDependencyAnalysisPass::isUsedByMatmulAB(Operation *op) {
+  SmallVector<Value> worklist(op->getResults().begin(), op->getResults().end());
+  llvm::DenseSet<Value> visited;
+
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second) {
+      continue;
+    }
+
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+
+      if (auto loopOp = dyn_cast<LoopLikeOpInterface>(user)) {
+        Value regionIterArg = loopOp.getTiedLoopRegionIterArg(&use);
+        if (regionIterArg) {
+          worklist.push_back(regionIterArg);
+        }
+        continue;
+      }
+
+      if (getSsbufferCoreType(user) == ssbufferCoreTypeVectorAttr) {
+        continue;
+      }
+
+      if (isa<linalg::MatmulOp>(user)) {
+        if (use.getOperandNumber() < 2) {
+          return true;
+        }
+      }
+
+      for (Value result : user->getResults()) {
+        worklist.push_back(result);
+      }
+    }
+  }
+
+  return false;
+}
+
 bool DataDependencyAnalysisPass::isCubeAndVectorOp(mlir::Operation *op) {
-  if (isa<tensor::EmptyOp, linalg::FillOp>(op)) {
+  if (!isa<tensor::EmptyOp, linalg::FillOp>(op)) {
+    return false;
+  }
+  if (getSsbufferCoreType(op) == ssbufferCoreTypeCubeAttr) {
     return true;
   }
-  return false;
+  if (isUsedByMatmulAB(op)) {
+    return false;
+  }
+  return true;
 }
 
 bool DataDependencyAnalysisPass::isValidShapeForDependency(mlir::Value value) {
@@ -388,7 +409,7 @@ bool DataDependencyAnalysisPass::collectDepInfo(
   depInfo.producerBlockId = commonLevelIds.first;
   depInfo.consumerBlockId = commonLevelIds.second;
 
-  analyzeDepLoopInfo(info, depInfo);
+  analyzeDepLoopInfo(module, depInfo);
 
   if (isAllTranspoesd) {
     depInfo.isAllTranspoesd = true;
@@ -969,7 +990,7 @@ void DataDependencyAnalysisPass::collectMemDepInfo(
   depInfo.predOp = predOp;
   depInfo.nextOp = nextOp;
 
-  analyzeDepLoopInfo(info, depInfo);
+  analyzeDepLoopInfo(module, depInfo);
 
   memoryDependencies.push_back(depInfo);
 }
@@ -1211,6 +1232,16 @@ void DataDependencyAnalysisPass::sortDependencies(
                 if (aConsOpOrder != bConsOpOrder) {
                   return aConsOpOrder < bConsOpOrder;
                 }
+
+                auto *aProdOp = a.value.getDefiningOp();
+                auto *bProdOp = b.value.getDefiningOp();
+                if (aProdOp && bProdOp) {
+                  unsigned aProdOpOrder = opOrder.lookup(aProdOp);
+                  unsigned bProdOpOrder = opOrder.lookup(bProdOp);
+                  if (aProdOpOrder != bProdOpOrder) {
+                    return aProdOpOrder < bProdOpOrder;
+                  }
+                }
               }
               return false;
             });
@@ -1258,7 +1289,9 @@ void DataDependencyAnalysisPass::runOnOperation() {
   sortDependencies(info.getC2VDependencies(), module);
   sortDependencies(info.getC2CDependencies(), module);
   sortDependencies(info.getIntraC2CDependencies(), module);
-  analyzeSyncReuse(info);
+
+  analyzeRedundantEdges(info, module);
+  analyzeSyncReuse(info, module);
 
   info.setValid(true);
 

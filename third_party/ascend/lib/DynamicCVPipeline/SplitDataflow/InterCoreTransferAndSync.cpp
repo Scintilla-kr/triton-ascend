@@ -260,21 +260,6 @@ static bool isValidC2CMatmulDependency(Value value, int consumerBlockId) {
   return hasAnyMatmulABInputUser(value, consumerBlockId);
 }
 
-bool hasStartEndSyncWhitelistKernel(ModuleOp module) {
-  std::vector<std::string> whitelist{
-      "_swa_bwd_dq_kernel",
-  };
-
-  bool isWhitelistKernel = false;
-  for (auto func : module.getOps<func::FuncOp>()) {
-    if (llvm::is_contained(whitelist, func.getName().str())) {
-      isWhitelistKernel = true;
-      break;
-    }
-  }
-  return isWhitelistKernel;
-}
-
 // Block Start/End Operation Retrieval
 std::pair<mlir::Operation *, mlir::Operation *>
 InterCoreTransferAndSyncPass::getBlockStartEnd(int targetId,
@@ -391,16 +376,26 @@ void InterCoreTransferAndSyncPass::findLoopRange(ModuleOp module) {
   auto latestAncestors = collectAncestorChain(latestLoop);
 
   Operation *commonAncestor = nullptr;
-  for (Operation *current = latestLoop; current;
-       current = current->getParentOp()) {
+  for (Operation *current : latestAncestors) {
     if (isa<scf::ForOp, scf::WhileOp>(current)) {
       continue;
     }
-    if (std::find(earliestAncestors.begin(), earliestAncestors.end(),
-                  current) != earliestAncestors.end()) {
-      commonAncestor = current;
-      break;
+    auto earliestIt =
+        std::find(earliestAncestors.begin(), earliestAncestors.end(), current);
+    auto latestIt =
+        std::find(latestAncestors.begin(), latestAncestors.end(), current);
+    if (earliestIt == earliestAncestors.end() ||
+        latestIt == latestAncestors.end()) {
+      continue;
     }
+    if (earliestIt != earliestAncestors.begin() &&
+        latestIt != latestAncestors.begin() &&
+        (*(earliestIt - 1))->getParentRegion() !=
+            (*(latestIt - 1))->getParentRegion()) {
+      continue;
+    }
+    commonAncestor = current;
+    break;
   }
 
   if (!commonAncestor) {
@@ -415,6 +410,7 @@ void InterCoreTransferAndSyncPass::findLoopRange(ModuleOp module) {
     }
     return *(it - 1);
   };
+  LOG_DEBUG("commonAncestor: " << *commonAncestor << "\n");
   loopStartBound = getSameLevelBound(earliestAncestors, commonAncestor);
   loopEndBound = getSameLevelBound(latestAncestors, commonAncestor);
   return;
@@ -830,6 +826,22 @@ mlir::Operation *InterCoreTransferAndSyncPass::getFixpipePointAfterProducer(
   if (blockId != producerBlockId) {
     return nullptr;
   }
+
+  while (Operation *nextOp = fixpipePoint->getNextNode()) {
+    if (CVPipeline::getOpBlockId(nextOp).value_or(-1) != producerBlockId ||
+        !isa<hivm::FixpipeOp>(nextOp)) {
+      break;
+    }
+    Operation *setOp = nextOp->getNextNode();
+    if (!setOp ||
+        CVPipeline::getOpBlockId(setOp).value_or(-1) != producerBlockId ||
+        !isa<hivm::SyncBlockSetOp>(setOp)) {
+      break;
+    }
+
+    fixpipePoint = setOp;
+  }
+
   return fixpipePoint;
 }
 
@@ -1171,6 +1183,9 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(
     Operation *consumedDataOp, bool isStoreDirectly) {
   LOG_DEBUG("Inserting inter-core synchronization for transferOp: "
             << *transferOp << "\n");
+  if (dep.flagId < 0) {
+    return;
+  }
 
   auto flagId = builder.getIntegerAttr(builder.getI64Type(), flag);
 
@@ -1238,6 +1253,13 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(
     }
     if (auto subBlockId = getSubBlockId(insertPoint.prodEnd)) {
       CVPipeline::setSubBlockId(setOpForWrite, *subBlockId);
+    }
+
+    if (isOutlineReuseBlacklistKernel(module)) {
+      Operation *mainLoopOp =
+          findMainLoopforTransfer(transferOp, insertPoint.consStart);
+      loopStartBound = mainLoopOp;
+      loopEndBound = mainLoopOp;
     }
 
     if (!dep.reuseStartEnd) {

@@ -99,6 +99,8 @@ class LaunchSpec:
     mix_ratio: int
     shared_mem_dynamic_size: int
 
+    profile_scratch_size: int = 0
+
     def as_dict(self):
         return asdict(self)
 
@@ -197,6 +199,7 @@ def make_launch_spec(metadata, npu_utils):
             task_type = candidate
     physical = npu_utils.get_aivector_core_num() if metadata.mix_mode == "aiv" else npu_utils.get_aicore_num()
     return LaunchSpec(
+        profile_scratch_size=int(getattr(metadata, "profile_scratch_size", 0) or 0),
         flags=flags,
         workspace_size=max(int(getattr(metadata, "workspace_size", 0)), 0),
         ordered_locks=ordered,
@@ -251,7 +254,7 @@ def make_tensordesc_arg(arg):
     return [arg.base, *arg.shape, *arg.strides, arg.padding == "nan", *arg.shape, *arg.strides]
 
 
-def wrap_handle_tensordesc(launcher, signature):
+def wrap_handle_tensordesc(launcher, signature, profile_scratch=False):
     signatures = tuple(signature.values())
     if not any(isinstance(sig, tuple) or sig.startswith("tensordesc") for sig in signatures):
         return launcher
@@ -266,10 +269,12 @@ def wrap_handle_tensordesc(launcher, signature):
         return [arg]
 
     def wrapped(*args):
-        if len(args) != 9 + len(signatures):
-            raise TypeError(f"launch expects {9 + len(signatures)} arguments, got {len(args)}")
-        flattened = [item for sig, value in zip(signatures, args[9:]) for item in expand(sig, value)]
-        return launcher(*args[:9], *flattened)
+        expected = 9 + len(signatures) + int(profile_scratch)
+        if len(args) != expected:
+            raise TypeError(f"launch expects {expected} arguments, got {len(args)}")
+        flattened = [item for sig, value in zip(signatures, args[9:9 + len(signatures)]) for item in expand(sig, value)]
+        scratch_args = args[-1:] if profile_scratch else ()
+        return launcher(*args[:9], *flattened, *scratch_args)
 
     return wrapped
 
@@ -314,16 +319,10 @@ def _shared_key(fingerprint, sources):
     return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
 
 
-def _build_shared(name, sources, debug=False, bin_dir=None):
+def _build_shared(name, sources, debug=False):
     fingerprint = utils.npu_extension_fingerprint(name, extra_cflags=_LAUNCHER_CFLAGS)
     key = _shared_key(json.dumps(fingerprint, sort_keys=True), tuple(sorted(sources.items())))
-    # bin_dir roots this shared artifact under a fixed installation directory
-    # instead of TRITON_CACHE_DIR (which PyTorch Inductor repoints per test
-    # case), keeping the artifact location tied to its content key.
-    if bin_dir is not None:
-        cache = utils.bin_cache_manager(key, bin_dir)
-    else:
-        cache = get_cache_manager(key)
+    cache = get_cache_manager(key)
     filename = name + sysconfig.get_config_var("EXT_SUFFIX")
     if debug:
         dump = get_dump_manager(key)
@@ -366,11 +365,7 @@ def get_runtime(npu_utils_path, debug=False):
         print_identity = (bisheng, utils._file_identity(bisheng), version_file,
                           utils._file_identity(version_file) if version_file else None)
     sources = {**_runtime_sources(), **_runtime_config(npu_utils_path, utils.backend_policy, print_identity)}
-    # The runtime lands under the backend's in-package bin/ directory (with the
-    # helper), so repointing TRITON_CACHE_DIR no longer strands or rebuilds
-    # the pair; the runtime key embeds the helper's stable location.
-    bin_dir = Path(__file__).with_name("bin")
-    path = _build_shared("__triton_launcher_runtime", sources, debug, bin_dir=bin_dir)
+    path = _build_shared("__triton_launcher_runtime", sources, debug)
     return _load_runtime(path), path
 
 
