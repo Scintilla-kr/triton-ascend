@@ -22,6 +22,7 @@ Triton-Ascend
 
 ## 🔥 Latest News
 
+- [2026.10.29] Triton-Ascend 3.6.0.post2 official releases are now available
 - [2026.10.15] Triton-Ascend 3.2.2.post2 and 3.6.0 official releases are now available
 - [2026.07.31] Triton-Ascend 3.2.2 official release is now available
 - [2026.04.30] Triton-Ascend 3.2.1 official release is now available
@@ -42,6 +43,10 @@ Triton-Ascend
 </div>
 
 ---
+
+## Introduction
+
+**Triton-Ascend** is an optimized version of Triton adapted for Huawei Ascend processors. It is used for efficient automatic kernel tuning, operator compilation, and deployment. By remaining compatible with Triton's core syntax while being deeply optimized for Huawei Ascend NPU features, it helps users quickly develop and deploy high-performance computing tasks on the Huawei Ascend platform.
 
 ## 📖 Quick Installation
 
@@ -76,6 +81,19 @@ If you need to access Huawei Ascend NPU computing resources for development or t
 pip install triton-ascend --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi
 ```
 
+### Nightly Build Installation
+
+A nightly package updated every day is available. Install it with the following command:
+
+```bash
+# Version format: <version>+devYYYYMMDD, example for nightly build on 2026/11/10
+pip install triton-ascend==3.6.0+dev20261110 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly
+```
+
+All nightly packages are also listed in the [history](https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly/triton-ascend/).
+
+> Note: Nightly packages are test builds and are not recommended for production use.
+
 ### Source Installation
 
 <div style="margin-left:1em">
@@ -99,8 +117,10 @@ pip install ninja cmake wheel pybind11 # build-time dependencies
 ```bash
 git clone https://github.com/triton-lang/triton-ascend.git && cd triton-ascend
 git checkout main
-pip install -e .
+pip install -e . --extra-index-url=https://repo.huaweicloud.com/repository/pypi/simple
 ```
+
+> Tip: Pass `--no-build-isolation` to `pip install` to make nop builds faster.
 
 #### Custom LLVM Build (Optional)
 
@@ -143,6 +163,22 @@ TRITON_WHEEL_NAME="triton-ascend" \
 TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF" \
 python3 setup.py install
 ```
+
+#### Verify the Installation
+
+Run:
+
+```bash
+python3 -c "import triton.backends.ascend as ascend;print('triton-ascend version:', ascend.__version__)"
+```
+
+If the output is:
+
+```bash
+triton-ascend version: <version>
+```
+
+Triton-Ascend is installed successfully.
 
 </details>
 </div>
