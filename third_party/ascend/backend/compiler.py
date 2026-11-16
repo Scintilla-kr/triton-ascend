@@ -308,6 +308,7 @@ def _graph_optimize_kwargs(opt):
     kwargs = {
         "ub_capacity_bytes": graph_ub_budget_bytes_for_arch(opt.target_arch),
         "compile_mode": opt.compile_mode,
+        "compile_on_910_95": opt.compile_on_910_95,
         # Zero capacities (unknown target) leave the cube L0 checks disabled.
         "mapping_l0a_capacity_bytes": l0a_kb * 1024,
         "mapping_l0b_capacity_bytes": l0b_kb * 1024,
@@ -481,6 +482,10 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         _load_val = metadata.get("buf_slot_num_of_gm")
         if _load_val is not None:
             ascend.passes.ttir.set_buffer_count(mod, "LOAD", _load_val)
+
+        enable_outer_main_loop = metadata.get("enable_outer_main_loop", False)
+        if enable_outer_main_loop:
+            ascend.passes.ttir.set_enable_outer_main_loop(mod)
 
         if opt.debug:
             # Print the equivalent triton-opt command line so the pass
@@ -751,7 +756,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
     linalg, metadata = _parse_linalg_metadata(linalg, metadata)
     _finalize_program_launch_policy(metadata, opt)
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_file_name = "kernel.mlir"
+        tmp_file_name = "kernel.ttadapter.mlir"
         ttadapter_path = os.path.join(tmpdir, tmp_file_name)
         Path(ttadapter_path).write_text(linalg)
         bin_file = os.path.join(tmpdir, "kernel")
@@ -997,7 +1002,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
     linalg, metadata = _parse_linalg_metadata(linalg, metadata)
     _finalize_program_launch_policy(metadata, opt)
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_file_name = "kernel.mlir"
+        tmp_file_name = "kernel.ttadapter.mlir"
         ttadapter_path = os.path.join(tmpdir, tmp_file_name)
         Path(ttadapter_path).write_text(linalg)
         bin_file = os.path.join(tmpdir, "kernel")
@@ -1338,6 +1343,7 @@ class NPUOptions:
     disable_auto_inject_block_sync: bool = None
     enable_mixed_cv: bool = None
     enable_dynamic_cv_pipeline: bool = None
+    enable_outer_main_loop: bool = False
     enable_tla_mode: bool = field(default=False, init=False)
     enable_cube_block_merge: bool = False
     hfusion_enable_multiple_consumer_fusion: bool = None

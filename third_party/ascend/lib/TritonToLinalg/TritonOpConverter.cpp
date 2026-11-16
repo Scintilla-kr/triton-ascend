@@ -32,6 +32,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
+#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVectorExtras.h"
@@ -54,9 +55,12 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HFusion/IR/HFusion.h"
@@ -618,63 +622,87 @@ SelectCanonicalizer::matchAndRewrite(arith::SelectOp op,
     return success();
   }
 
-  // For Tail or Middle positions, we need to compute inverted dimensions
-  // to handle the masking logic
-  SmallVector<OpFoldResult> invertOffsets;
-  SmallVector<OpFoldResult> invertFalseDims;
-  SmallVector<OpFoldResult> invertTrueDims;
-  OpFoldResult falseDimOp;
-  OpFoldResult trueDimOp;
-  int valDim = -1;
+  // Tail/Middle masks may have a dynamic start outside the tensor. Keep the
+  // same bounds check for both target-specific slice implementations.
+  Value dynamicOffset;
+  int dynamicDim = -1;
   for (int i = 0; i < mstate.getRank(); ++i) {
-    const auto &offVal = mstate.offsets[i];
-    const auto &dimVal = mstate.dims[i];
-    auto constOffVal = getConstantIntValue(offVal);
-    invertOffsets.push_back(rewriter.getIndexAttr(0));
-    if (constOffVal.has_value() && constOffVal.value() == 0) {
-      invertFalseDims.push_back(dimVal);
-      invertTrueDims.push_back(dimVal);
-    } else {
-      assert(valDim == -1 &&
-             "The offset in only one dimension can be not zero.");
-      if (!constOffVal.has_value()) {
-        valDim = i;
-        falseDimOp = offVal;
-      }
-
-      invertFalseDims.push_back(offVal);
-      trueDimOp = addOpFoldResult(offVal, dimVal, loc, rewriter,
-                                  rewriter.getIndexType());
-      invertTrueDims.push_back(trueDimOp);
+    if (!getConstantIntValue(mstate.offsets[i]).has_value()) {
+      assert(dynamicDim == -1 &&
+             "The offset in only one dimension can be dynamic.");
+      dynamicDim = i;
+      dynamicOffset = cast<Value>(mstate.offsets[i]);
     }
   }
 
-  // Slice out the invert first masked part of false tensor
-  auto falseExtractSliceOp = mstate.getExtractSlice(
-      falseTensor, loc, rewriter, invertOffsets, invertFalseDims);
-  // Insert out the sliced false tensor into true tensor
-  auto trueInsertSliceOp =
-      mstate.getInsertSlice(falseExtractSliceOp, trueTensor, loc, rewriter,
-                            invertOffsets, invertFalseDims);
-  // Slice out the invert first masked and masked part of inserted true tensor
-  auto extractSliceOp = mstate.getExtractSlice(trueInsertSliceOp, loc, rewriter,
-                                               invertOffsets, invertTrueDims);
-  // Insert out the sliced true tensor into false tensor
-  auto insertSliceOp =
-      mstate.getInsertSlice(extractSliceOp, falseTensor, loc, rewriter,
-                            invertOffsets, invertTrueDims);
-  if (valDim != -1) {
-    rewriter.setInsertionPointAfter(trueInsertSliceOp);
-    assert(isa<Value>(falseDimOp) &&
-           "Expected to be a runtime Value for dynamic dimension check.");
+  // A constant destination needs a writable copy of the whole tensor. For a
+  // tail mask, copying the complementary false prefix into a single-use true
+  // value instead lets bufferization reuse the computed value's buffer.
+  bool overwriteFalsePrefix = maskPos == MaskPosition::Tail &&
+                              matchPattern(falseTensor, m_Constant()) &&
+                              trueTensor.hasOneUse();
+  Value sliceSource = trueTensor;
+  Value sliceDest = falseTensor;
+  SmallVector<OpFoldResult> sliceOffsets(mstate.offsets);
+  SmallVector<OpFoldResult> sliceDims(mstate.dims);
+  SmallVector<Operation *> sliceOps;
+  if (overwriteFalsePrefix) {
+    sliceSource = falseTensor;
+    sliceDest = trueTensor;
+    for (int i = 0; i < mstate.getRank(); ++i) {
+      if (!isConstantIntValue(mstate.offsets[i], 0))
+        sliceDims[i] = mstate.offsets[i];
+      sliceOffsets[i] = rewriter.getIndexAttr(0);
+    }
+  } else if (!useDirectSelectSlices) {
+    // A2/A3 require the prefix reconstruction to keep all slice starts at zero.
+    // Direct dynamic starts can trigger NPU IR alignment padding and UB
+    // overflow. 950 supports unaligned UB copies and can use the original mask
+    // offsets.
+    SmallVector<OpFoldResult> invertOffsets;
+    SmallVector<OpFoldResult> invertFalseDims;
+    SmallVector<OpFoldResult> invertTrueDims;
+    for (int i = 0; i < mstate.getRank(); ++i) {
+      const auto &offset = mstate.offsets[i];
+      const auto &dim = mstate.dims[i];
+      invertOffsets.push_back(rewriter.getIndexAttr(0));
+      if (isConstantIntValue(offset, 0)) {
+        invertFalseDims.push_back(dim);
+        invertTrueDims.push_back(dim);
+      } else {
+        invertFalseDims.push_back(offset);
+        invertTrueDims.push_back(addOpFoldResult(offset, dim, loc, rewriter,
+                                                 rewriter.getIndexType()));
+      }
+    }
+
+    auto falseExtractSliceOp = mstate.getExtractSlice(
+        falseTensor, loc, rewriter, invertOffsets, invertFalseDims);
+    auto trueInsertSliceOp =
+        mstate.getInsertSlice(falseExtractSliceOp, trueTensor, loc, rewriter,
+                              invertOffsets, invertFalseDims);
+    sliceOps.push_back(falseExtractSliceOp.getOperation());
+    sliceOps.push_back(trueInsertSliceOp.getOperation());
+    sliceSource = trueInsertSliceOp;
+    sliceOffsets = std::move(invertOffsets);
+    sliceDims = std::move(invertTrueDims);
+  }
+
+  auto extractSliceOp = mstate.getExtractSlice(sliceSource, loc, rewriter,
+                                               sliceOffsets, sliceDims);
+  auto insertSliceOp = mstate.getInsertSlice(extractSliceOp, sliceDest, loc,
+                                             rewriter, sliceOffsets, sliceDims);
+  sliceOps.push_back(extractSliceOp.getOperation());
+  sliceOps.push_back(insertSliceOp.getOperation());
+  if (dynamicDim != -1) {
+    rewriter.setInsertionPointAfter(insertSliceOp);
     Value zeroIndex = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     Value isNegative = rewriter.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::slt, cast<Value>(falseDimOp), zeroIndex);
-
+        loc, arith::CmpIPredicate::slt, dynamicOffset, zeroIndex);
     Value sizeIndex =
-        rewriter.create<arith::ConstantIndexOp>(loc, tensorShape[valDim]);
+        rewriter.create<arith::ConstantIndexOp>(loc, tensorShape[dynamicDim]);
     Value isOutOfRange = rewriter.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::sge, cast<Value>(falseDimOp), sizeIndex);
+        loc, arith::CmpIPredicate::sge, dynamicOffset, sizeIndex);
     auto orOp = rewriter.create<arith::OrIOp>(loc, isNegative, isOutOfRange);
     auto ifOp = rewriter.create<scf::IfOp>(loc, TypeRange{type},
                                            orOp.getResult(), true, true);
@@ -684,27 +712,22 @@ SelectCanonicalizer::matchAndRewrite(arith::SelectOp op,
     rewriter.create<scf::YieldOp>(loc, ValueRange{falseTensor});
 
     Block *elseBlock = &ifOp.getElseRegion().front();
-    rewriter.setInsertionPointToStart(elseBlock);
-    falseExtractSliceOp->moveBefore(elseBlock, elseBlock->begin());
-    trueInsertSliceOp->moveAfter(falseExtractSliceOp);
-    extractSliceOp->moveAfter(trueInsertSliceOp);
-    insertSliceOp->moveAfter(extractSliceOp);
-
+    for (Operation *sliceOp : sliceOps)
+      sliceOp->moveBefore(elseBlock, elseBlock->end());
     rewriter.setInsertionPointAfter(insertSliceOp);
     rewriter.create<scf::YieldOp>(loc, ValueRange{insertSliceOp.getResult()});
     rewriter.replaceOp(op, ifOp);
-  } else { // static offsets
+  } else {
     rewriter.replaceOp(op, insertSliceOp);
   }
   LLVM_DEBUG({
-    llvm::dbgs() << "  -> [invert] Created false tensor extractSlice: "
-                 << *falseExtractSliceOp.getOperation() << "\n"
-                 << "  -> [invert] Created true tensor insertSlice: "
-                 << *trueInsertSliceOp.getOperation() << "\n"
-                 << "  -> [invert] Created ExtractSlice: "
-                 << *extractSliceOp.getOperation() << "\n"
-                 << "  -> [invert] Created InsertSlice: "
-                 << *insertSliceOp.getOperation() << "\n";
+    llvm::dbgs() << "  -> Created "
+                 << (overwriteFalsePrefix    ? "false-prefix"
+                     : useDirectSelectSlices ? "direct"
+                                             : "prefix")
+                 << " select slices:\n";
+    for (Operation *sliceOp : sliceOps)
+      llvm::dbgs() << "     " << *sliceOp << "\n";
   });
   return success();
 }
@@ -789,6 +812,39 @@ BitcastCanonicalizer::matchAndRewrite(triton::BitcastOp bitcastOp,
   return failure();
 }
 
+static Value clampToFiniteFp8Range(Value input, Type dstElemType, Location loc,
+                                   PatternRewriter &rewriter) {
+  if (!isa<Float8E4M3FNType, Float8E5M2Type>(dstElemType))
+    return input;
+
+  auto srcElemType = cast<FloatType>(getElementTypeOrSelf(input.getType()));
+  auto dstFloatType = cast<FloatType>(dstElemType);
+  auto limit = llvm::APFloat::getLargest(dstFloatType.getFloatSemantics());
+  bool losesInfo;
+  limit.convert(srcElemType.getFloatSemantics(),
+                llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+
+  auto createBound = [&](const llvm::APFloat &value) -> Value {
+    auto boundAttr = rewriter.getFloatAttr(srcElemType, value);
+    TypedAttr attr = boundAttr;
+    if (auto tensorType = dyn_cast<RankedTensorType>(input.getType()))
+      attr = DenseElementsAttr::get(tensorType, ArrayRef<Attribute>{boundAttr});
+    return rewriter.create<arith::ConstantOp>(loc, attr);
+  };
+  Value upper = createBound(limit);
+  limit.changeSign();
+  Value lower = createBound(limit);
+
+  // Triton FP8 downcasts saturate finite overflows and infinities. Ordered
+  // comparisons keep NaNs and signed zeros unchanged before rounding.
+  Value above = rewriter.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGT,
+                                               input, upper);
+  Value clamped = rewriter.create<arith::SelectOp>(loc, above, upper, input);
+  Value below = rewriter.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OLT,
+                                               clamped, lower);
+  return rewriter.create<arith::SelectOp>(loc, below, lower, clamped);
+}
+
 LogicalResult
 FpToFpCanonicalizer::matchAndRewrite(triton::FpToFpOp op,
                                      PatternRewriter &rewriter) const {
@@ -851,12 +907,15 @@ FpToFpCanonicalizer::matchAndRewrite(triton::FpToFpOp op,
 
     auto extOp = rewriter.create<arith::ExtFOp>(loc, f32Type, input);
     extOp->setAttr("round_mode", roundModeAttr);
+    Value truncInput =
+        clampToFiniteFp8Range(extOp.getResult(), dstElemType, loc, rewriter);
     auto truncOp =
-        rewriter.create<arith::TruncFOp>(loc, resultType, extOp.getResult());
+        rewriter.create<arith::TruncFOp>(loc, resultType, truncInput);
     truncOp->setAttr("round_mode", roundModeAttr);
     rewriter.replaceOp(op, truncOp.getResult());
   } else if (srcBitwidth > dstBitwidth) {
     // Downcast: use arith.truncf with round_mode=rint
+    input = clampToFiniteFp8Range(input, dstElemType, loc, rewriter);
     auto truncOp = rewriter.create<arith::TruncFOp>(loc, resultType, input);
     truncOp->setAttr("round_mode", roundModeAttr);
     rewriter.replaceOp(op, truncOp.getResult());
@@ -1254,51 +1313,6 @@ ReshapeConverter::matchAndRewrite(triton::ReshapeOp op, OpAdaptor adaptor,
   insertDebugNop(loc, rewriter);
   Value src = op.getSrc();
   auto dst = op.getResult();
-
-  if (op.getAllowReorder()) {
-    auto srcShape = cast<ShapedType>(src.getType()).getShape();
-    auto dstShape = cast<ShapedType>(dst.getType()).getShape();
-
-    SmallVector<std::pair<int64_t, size_t>> srcCore;
-    SmallVector<int64_t> dstCore;
-    for (auto [i, extent] : llvm::enumerate(srcShape))
-      if (extent != 1)
-        srcCore.emplace_back(extent, i);
-    for (int64_t extent : dstShape)
-      if (extent != 1)
-        dstCore.push_back(extent);
-
-    if (srcCore.size() == dstCore.size() &&
-        !std::equal(srcCore.begin(), srcCore.end(), dstCore.begin(),
-                    [](const auto &core, int64_t extent) {
-                      return core.first == extent;
-                    })) {
-
-      SmallVector<bool> used(srcCore.size(), false);
-      SmallVector<bool> placed(srcShape.size(), false);
-      SmallVector<int> order;
-      for (int64_t extent : dstCore) {
-        size_t match = srcCore.size();
-        for (size_t j = 0; j < srcCore.size() && match == srcCore.size(); ++j)
-          if (!used[j] && srcCore[j].first == extent)
-            match = j;
-        if (match == srcCore.size()) {
-          return rewriter.notifyMatchFailure(
-              loc,
-              "allow_reorder reshape: destination non-singleton extent has no "
-              "matching source non-singleton extent");
-        }
-        used[match] = true;
-        order.push_back(static_cast<int>(srcCore[match].second));
-        placed[srcCore[match].second] = true;
-      }
-
-      for (size_t i = 0; i < srcShape.size(); ++i)
-        if (!placed[i])
-          order.push_back(static_cast<int>(i));
-      src = ConverterUtils::getTransposedValue(src, loc, rewriter, order);
-    }
-  }
 
   Value shape = rewriter.create<arith::ConstantOp>(
       loc,
@@ -2184,6 +2198,43 @@ LogicalResult ScanConverter::convertToTargetOpExtended(
   return success();
 }
 
+static bool isInvariantInLoop(Value value, LoopLikeOpInterface loop) {
+  if (auto arg = dyn_cast<BlockArgument>(value)) {
+    Operation *owner = arg.getOwner()->getParentOp();
+    return !owner ||
+           (owner != loop.getOperation() && !loop->isProperAncestor(owner));
+  }
+  if (loop.isDefinedOutsideOfLoop(value))
+    return true;
+  Operation *def = value.getDefiningOp();
+  if (!def || def->getNumRegions() != 0 || !isMemoryEffectFree(def))
+    return false;
+  return llvm::all_of(def->getOperands(), [&](Value operand) {
+    return isInvariantInLoop(operand, loop);
+  });
+}
+
+static bool isInvariantInEnclosingLoop(Operation *op, Value value) {
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (auto loop = dyn_cast<LoopLikeOpInterface>(parent))
+      if (isInvariantInLoop(value, loop))
+        return true;
+  }
+  return false;
+}
+
+static bool canReuseLibdeviceInput(Operation *op, Value input) {
+  // Memory-based targets do not guarantee that libdevice implementations can
+  // read an input after writing an aliased output.
+  if (!compileOn91095Flag)
+    return false;
+  auto tensorTy = dyn_cast<RankedTensorType>(input.getType());
+  return tensorTy && tensorTy.hasStaticShape() &&
+         tensorTy.getNumElements() > 1 && input.getDefiningOp() &&
+         input.hasOneUse() && !isInvariantInEnclosingLoop(op, input);
+}
+
 LogicalResult ExternElementwiseClOpConverter::matchAndRewrite(
     triton::ExternElementwiseOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
@@ -2218,6 +2269,15 @@ LogicalResult ExternElementwiseClOpConverter::matchAndRewrite(
           return op.getSymbol().ends_with(suffix);
         });
     if (isLibdeviceOp) {
+      // Collect reusable input buffers
+      SmallVector<unsigned> reuseCandidates;
+      if (!isDstScalar) {
+        for (auto [index, src] : llvm::enumerate(op.getSrcs())) {
+          if (canReuseLibdeviceInput(op, src))
+            reuseCandidates.push_back(index);
+        }
+      }
+
       auto originalTensorType = isDstScalar
                                     ? RankedTensorType::get({1}, dstElemTy)
                                     : cast<RankedTensorType>(dstTy);
@@ -2290,12 +2350,29 @@ LogicalResult ExternElementwiseClOpConverter::matchAndRewrite(
                   "libdevice output");
       }
 
-      auto outputMemRefType =
-          MemRefType::get(customOutputType.getShape(), customElemType);
-      Value outputMemRef = rewriter.create<memref::AllocOp>(
-          op.getLoc(), outputMemRefType, dynamicSizes);
-      Value outputTensor = rewriter.create<bufferization::ToTensorOp>(
-          op.getLoc(), customOutputType, outputMemRef, true, true);
+      // Reuse a suitable input buffer as the output buffer
+      bool reuseInput = !isDstScalar && !reuseCandidates.empty();
+      unsigned reuseInputIndex = collapsedInputs.size();
+      if (reuseInput) {
+        for (unsigned index : reuseCandidates) {
+          if (collapsedInputs[index].getType() == customOutputType) {
+            reuseInputIndex = index;
+            break;
+          }
+        }
+        reuseInput = reuseInputIndex != collapsedInputs.size();
+      }
+      Value outputTensor;
+      if (reuseInput) {
+        outputTensor = collapsedInputs[reuseInputIndex];
+      } else {
+        auto outputMemRefType =
+            MemRefType::get(customOutputType.getShape(), customElemType);
+        Value outputMemRef = rewriter.create<memref::AllocOp>(
+            op.getLoc(), outputMemRefType, dynamicSizes);
+        outputTensor = rewriter.create<bufferization::ToTensorOp>(
+            op.getLoc(), customOutputType, outputMemRef, true, true);
+      }
 
       ReassociationIndices outputReassociation;
       if (needsExpand) {
@@ -2310,6 +2387,17 @@ LogicalResult ExternElementwiseClOpConverter::matchAndRewrite(
           ValueRange{outputTensor});
 
       auto argAttrsArray = mlir::ArrayAttr::get(customOp->getContext(), {});
+      if (reuseInput) {
+        // inplace_outs records which input argument shares its buffer with the
+        // custom op output.
+        auto inplaceAttr =
+            rewriter.getNamedAttr(hivm::CustomOp::kInplaceOutsAttrName,
+                                  rewriter.getI32IntegerAttr(0));
+        SmallVector<Attribute> argAttrs(collapsedInputs.size(),
+                                        rewriter.getDictionaryAttr({}));
+        argAttrs[reuseInputIndex] = rewriter.getDictionaryAttr({inplaceAttr});
+        argAttrsArray = rewriter.getArrayAttr(argAttrs);
+      }
       auto pipeAttr =
           hivm::PipeAttr::get(customOp->getContext(), hivm::PIPE::PIPE_V);
       auto tcoreTypeAttr = hivm::TCoreTypeAttr::get(customOp->getContext(),
