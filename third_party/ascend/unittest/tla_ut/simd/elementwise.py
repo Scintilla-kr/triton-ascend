@@ -17,7 +17,7 @@ compose in one SIMD scope and that the runtime launch matches the reference.
 The per-interface contracts (mask matrix, MODE_ZEROING/MERGING merge source,
 unsigned zeroing, exact tier, dtype aliases, 64-lane wide registers, scalar
 bounds) live in ``vector/vdiv.py``, ``vexp.py``, ``vmax.py``, ``vmin.py``,
-``vmaxs.py``, ``vdup.py``, ``vdups.py`` and ``vdupv.py``; the runtime-N tail /
+``vmaxs.py``, ``vdup.py`` and ``vdupv.py``; the runtime-N tail /
 multi-chunk / multi-core matrix lives in ``vector/simd_tail.py``.  Keeping that
 detail out of this file avoids two copies of the same IR assertions.
 
@@ -43,8 +43,10 @@ SIGNATURE = {"X_ptr": "*fp32", "O_ptr": "*fp32", "num_tokens": "i32"}
 def simd_elementwise(X_ptr, O_ptr, num_tokens, TMAX: tl.constexpr, BLK: tl.constexpr, CORES: tl.constexpr):
     tl.static_assert(BLK == 64, "one full f32 register per tile")
     tl.static_assert(TMAX % 2 == 0, "one pair of rows per output row")
-    xy_ub = tla.alloc((2, BLK), tl.float32, space="ub", versions=2)
-    o_ub = tla.alloc((BLK, ), tl.float32, space="ub", versions=2)
+    xy_ub = tla.alloc((2, BLK), tl.float32, space="ub")
+    o_ub = tla.alloc((BLK, ), tl.float32, space="ub")
+    tla.annotate_multi_buffer(xy_ub, 2)
+    tla.annotate_multi_buffer(o_ub, 2)
     for p in range(tl.program_id(0), num_tokens // 2, CORES):
         xy = tla.view(X_ptr, (2, BLK), strides=(BLK, 1), offsets=(2 * p, 0))
         o = tla.view(O_ptr, (BLK, ), strides=(1, ), offsets=(p * BLK, ))
@@ -79,7 +81,7 @@ def test_ir(output_dir=None):
     for probe in ("ave.hir.vdiv", "ave.hir.vmax", "ave.hir.vmin", "ave.hir.vmaxs", "ave.hir.vexp", "ave.hir.broadcast"):
         assert probe in text, f"missing {probe} in lowered IR"
     # vdup must be the masked broadcast, never the unmasked scalar_broadcast
-    assert "ave.hir.scalar_broadcast" not in text, "vdup must not degrade to vsplat"
+    assert "ave.hir.scalar_broadcast" not in text, "vdup must emit a masked broadcast"
     # The combined chain ends in an explicit vsel, which is the only select here.
     assert text.count("ave.hir.vsel") == 1
     print("IR PASS: combined vdiv/vmax/vmin/vmaxs/vexp/vdup chain plus vsel")

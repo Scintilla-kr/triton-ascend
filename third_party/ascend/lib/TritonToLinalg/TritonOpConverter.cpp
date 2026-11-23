@@ -22,6 +22,7 @@
  */
 
 #include "ascend/include/TritonToLinalg/TritonOpConverter.h"
+#include "ascend/include/TritonToGraph/BlockBatching/ElementwiseModels.h"
 #include "ascend/include/TritonToLinalg/MaskAnalysis.h"
 #include "ascend/include/TritonToLinalg/TritonToLinalgPass.h"
 #include "ascend/include/Utils/DebugUtils.h"
@@ -31,7 +32,6 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
-#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVectorExtras.h"
@@ -51,7 +51,6 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
@@ -112,15 +111,22 @@ BitcastConverter::matchAndRewrite(triton::BitcastOp op, OpAdaptor adaptor,
                                            pointerInfos, rewriter);
     if (failed(source))
       return failure();
-    auto address = materializePointerAddress(*source, loc, rewriter);
-    if (failed(address))
-      return failure();
     Type element = dstPtrTy.getPointeeType();
     if (element.isInteger(1))
       element = rewriter.getI8Type();
-    result = createScalarPointerCast(
-        rewriter, loc, MemRefType::get({ShapedType::kDynamic}, element),
-        *address);
+    auto resultType = MemRefType::get({ShapedType::kDynamic}, element);
+    // Bool and byte pointers lower to the same memref. Preserve its base so
+    // downstream bufferization can trace views back to the kernel argument.
+    // An offset-bearing source still needs its displacement in the address.
+    if (source->getType() == resultType) {
+      rewriter.replaceOp(op, *source);
+      return success();
+    }
+
+    auto address = materializePointerAddress(*source, loc, rewriter);
+    if (failed(address))
+      return failure();
+    result = createScalarPointerCast(rewriter, loc, resultType, *address);
 
   } else {
     // handling normal case: bitcast between tensors/memrefs
@@ -387,9 +393,42 @@ LogicalResult PreciseDivConverter::matchAndRewrite(
   return success();
 }
 
+static bool canOverwriteRowSuffix(arith::SelectOp op, const MaskState &mask,
+                                  ArrayRef<int64_t> shape) {
+  // A private fill can receive the active rows, releasing the computed
+  // tile after the copy. Prefer overwriting the computed tile only when
+  // other uses need the original fill.
+  if (op.getFalseValue().hasOneUse())
+    return false;
+
+  Operation *producer = op.getTrueValue().getDefiningOp();
+  auto constant = op.getFalseValue().getDefiningOp<arith::ConstantOp>();
+  if (!producer || !producer->hasTrait<OpTrait::Elementwise>() ||
+      !op.getTrueValue().hasOneUse() || !constant ||
+      !isa<SplatElementsAttr>(constant.getValue()))
+    return false;
+
+  // The complement of a head mask is a single row suffix only if every
+  // trailing dimension is covered in full.
+  if (shape.size() < 2 || llvm::is_contained(shape, ShapedType::kDynamic) ||
+      getConstantIntValue(mask.dims.front()))
+    return false;
+  for (size_t i = 1; i < shape.size(); ++i)
+    if (!isConstantIntValue(mask.dims[i], shape[i]))
+      return false;
+  return true;
+}
+
 LogicalResult
 SelectCanonicalizer::matchAndRewrite(arith::SelectOp op,
                                      PatternRewriter &rewriter) const {
+  // A batch safety select sanitizes inputs before a potentially undefined
+  // operation. Keep that ordering while allowing elementwise fusion; the
+  // slice/insert form materializes a filled tensor and a UB-to-UB copy even
+  // for a fully active group. Ordinary structured selects are unchanged.
+  if (op->hasAttr(mlir::triton::cfg::kBatchSafeInputAttr))
+    return failure();
+
   auto loc = op.getLoc();
 
   // 0. Shortcut for scalars and bool type
@@ -442,12 +481,21 @@ SelectCanonicalizer::matchAndRewrite(arith::SelectOp op,
 
   // 3. Slice and insert out the masked part
   if (maskPos == MaskPosition::Head) {
-    // Slice out the masked part of true tensor
-    auto extractSliceOp = mstate.getExtractSlice(trueTensor, loc, rewriter);
-
-    // Insert out the sliced true tensor into false tensor
+    Value source = trueTensor;
+    Value dest = falseTensor;
+    if (useDirectSelectSlices &&
+        canOverwriteRowSuffix(op, mstate, tensorShape)) {
+      // Keep the computed rows in place. A full tile has no false rows to copy.
+      source = falseTensor;
+      dest = trueTensor;
+      mstate.offsets.front() = mstate.dims.front();
+      mstate.dims.front() =
+          subOpFoldResult(rewriter.getIndexAttr(tensorShape.front()),
+                          mstate.offsets.front(), loc, rewriter);
+    }
+    auto extractSliceOp = mstate.getExtractSlice(source, loc, rewriter);
     auto insertSliceOp =
-        mstate.getInsertSlice(extractSliceOp, falseTensor, loc, rewriter);
+        mstate.getInsertSlice(extractSliceOp, dest, loc, rewriter);
 
     LLVM_DEBUG({
       llvm::dbgs() << "  -> Created ExtractSlice: "
@@ -668,37 +716,30 @@ BitcastCanonicalizer::matchAndRewrite(triton::BitcastOp bitcastOp,
   return failure();
 }
 
-static Value clampToFiniteFp8Range(Value input, Type dstElemType, Location loc,
-                                   PatternRewriter &rewriter) {
-  if (!isa<Float8E4M3FNType, Float8E5M2Type>(dstElemType))
-    return input;
+// arith.truncf's generic constant folder does not interpret enable_saturate.
+static TypedAttr foldNativeFp8Constant(Value input, FloatType dstType) {
+  auto constant = input.getDefiningOp<arith::ConstantOp>();
+  if (!constant)
+    return {};
 
-  auto srcElemType = cast<FloatType>(getElementTypeOrSelf(input.getType()));
-  auto dstFloatType = cast<FloatType>(dstElemType);
-  auto limit = llvm::APFloat::getLargest(dstFloatType.getFloatSemantics());
-  bool losesInfo;
-  limit.convert(srcElemType.getFloatSemantics(),
-                llvm::APFloat::rmNearestTiesToEven, &losesInfo);
-
-  auto createBound = [&](const llvm::APFloat &value) -> Value {
-    auto boundAttr = rewriter.getFloatAttr(srcElemType, value);
-    TypedAttr attr = boundAttr;
-    if (auto tensorType = dyn_cast<RankedTensorType>(input.getType()))
-      attr = DenseElementsAttr::get(tensorType, ArrayRef<Attribute>{boundAttr});
-    return rewriter.create<arith::ConstantOp>(loc, attr);
+  const auto &semantics = dstType.getFloatSemantics();
+  auto convert = [&](APFloat value) {
+    if (value.isNaN())
+      return APFloat::getZero(semantics);
+    bool negative = value.isNegative();
+    bool losesInfo;
+    value.convert(semantics, APFloat::rmNearestTiesToEven, &losesInfo);
+    if (!value.isFinite())
+      return APFloat::getLargest(semantics, negative);
+    return value;
   };
-  Value upper = createBound(limit);
-  limit.changeSign();
-  Value lower = createBound(limit);
-
-  // Triton FP8 downcasts saturate finite overflows and infinities. Ordered
-  // comparisons keep NaNs and signed zeros unchanged before rounding.
-  Value above = rewriter.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGT,
-                                               input, upper);
-  Value clamped = rewriter.create<arith::SelectOp>(loc, above, upper, input);
-  Value below = rewriter.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OLT,
-                                               clamped, lower);
-  return rewriter.create<arith::SelectOp>(loc, below, lower, clamped);
+  if (auto scalar = dyn_cast<FloatAttr>(constant.getValue()))
+    return FloatAttr::get(dstType, convert(scalar.getValue()));
+  if (auto dense = dyn_cast<DenseFPElementsAttr>(constant.getValue()))
+    return dense.mapValues(dstType, [&](const APFloat &value) {
+      return convert(value).bitcastToAPInt();
+    });
+  return {};
 }
 
 LogicalResult
@@ -763,17 +804,25 @@ FpToFpCanonicalizer::matchAndRewrite(triton::FpToFpOp op,
 
     auto extOp = rewriter.create<arith::ExtFOp>(loc, f32Type, input);
     extOp->setAttr("round_mode", roundModeAttr);
-    Value truncInput =
-        clampToFiniteFp8Range(extOp.getResult(), dstElemType, loc, rewriter);
     auto truncOp =
-        rewriter.create<arith::TruncFOp>(loc, resultType, truncInput);
+        rewriter.create<arith::TruncFOp>(loc, resultType, extOp.getResult());
     truncOp->setAttr("round_mode", roundModeAttr);
     rewriter.replaceOp(op, truncOp.getResult());
   } else if (srcBitwidth > dstBitwidth) {
     // Downcast: use arith.truncf with round_mode=rint
-    input = clampToFiniteFp8Range(input, dstElemType, loc, rewriter);
+    bool saturate = srcElemType.isF32() &&
+                    isa<Float8E4M3FNType, Float8E5M2Type>(dstElemType);
+    if (saturate) {
+      if (auto value =
+              foldNativeFp8Constant(input, cast<FloatType>(dstElemType))) {
+        rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, value);
+        return success();
+      }
+    }
     auto truncOp = rewriter.create<arith::TruncFOp>(loc, resultType, input);
     truncOp->setAttr("round_mode", roundModeAttr);
+    if (saturate)
+      truncOp->setAttr("enable_saturate", rewriter.getBoolAttr(true));
     rewriter.replaceOp(op, truncOp.getResult());
   } else {
     // Upcast: use arith.extf with round_mode=rint
@@ -2596,11 +2645,8 @@ LogicalResult DevicePrintConverter::matchAndRewrite(
   auto moduleOp = op->getParentOfType<ModuleOp>();
   rewriter.setInsertionPoint(moduleOp.getBody(),
                              std::prev(moduleOp.getBody()->end()));
-  SmallVector<Type, 4> inputTypes;
-  for (auto arg : op.getArgs()) {
-    inputTypes.push_back(arg.getType());
-  }
-  auto libFnType = rewriter.getFunctionType(inputTypes, {});
+  ValueRange args = adaptor.getArgs();
+  auto libFnType = rewriter.getFunctionType(args.getTypes(), {});
   // See ScanConverter: the name is uniqued before the op is created so that a
   // kernel named "triton_print" cannot make SymbolTable assert.
   auto funcName =
@@ -2612,9 +2658,10 @@ LogicalResult DevicePrintConverter::matchAndRewrite(
   funcOp->setAttr(prefixAttrName, prefixAttr);
   auto hexAttr = op.getHexAttr();
   funcOp->setAttr(hexAttrName, hexAttr);
+  funcOp->setAttr("isSigned", op.getIsSignedAttr());
 
   rewriter.setInsertionPoint(op);
-  rewriter.create<func::CallOp>(op.getLoc(), funcOp, op.getArgs());
+  rewriter.create<func::CallOp>(op.getLoc(), funcOp, args);
 
   rewriter.eraseOp(op);
   return success();
@@ -2678,8 +2725,41 @@ MatmulConverter::matchAndRewrite(triton::DotOp op, OpAdaptor adaptor,
       inputPrec = InputPrecision::IEEE;
     }
   }
+  // The batching rewrite has already preserved each lane's complete dot
+  // tensor, including its masked-load padding. Pass those logical M/K/N
+  // extents explicitly: the packaged consumer cannot infer them through a
+  // buffer initialized once and populated by masked per-lane subview copies.
+  // Its failed inference otherwise leaves the placeholder M/K/N at zero.
+  // This is not a proof that memory masks are true; all masked loads/stores
+  // and the launch guard's reduction/footprint checks remain unchanged.
+  bool explicitBatchMKN = op->hasAttr("tt.cv_batch_full_mkn");
+  if (explicitBatchMKN && (dstType.getRank() != 3 || !dstType.hasStaticShape()))
+    return op.emitError(
+        "explicit CV batch dimensions require a static rank-3 dot");
   auto createOp = [&](auto &&rewriter, ValueRange operands,
                       ValueRange results) -> Operation * {
+    if (explicitBatchMKN) {
+      auto aType = cast<RankedTensorType>(operands[0].getType());
+      auto bType = cast<RankedTensorType>(operands[1].getType());
+      auto loc = op.getLoc();
+      Value m = rewriter.template create<arith::ConstantIndexOp>(
+          loc, aType.getDimSize(1));
+      Value k = rewriter.template create<arith::ConstantIndexOp>(
+          loc, aType.getDimSize(2));
+      Value n = rewriter.template create<arith::ConstantIndexOp>(
+          loc, bType.getDimSize(2));
+      Value init = rewriter.template create<arith::ConstantIntOp>(loc, 0, 1);
+      auto batch = rewriter.template create<hivm::BatchMmadL1Op>(
+          loc, TypeRange{results[0].getType()}, operands[0], operands[1], init,
+          m, k, n, results[0]);
+      // The extents describe the padded mathematical tensors, not the valid
+      // DMA subviews. Layout/transpose folding must not re-infer them from
+      // those subviews or shrink the zero-padded dot.
+      batch->setAttr("already_set_real_mkn", rewriter.getUnitAttr());
+      if (inputPrec == InputPrecision::HF32)
+        batch->setAttr("enable_HF32", rewriter.getUnitAttr());
+      return batch;
+    }
     if (dstType.getRank() == 2)
       return rewriter.template create<linalg::MatmulOp>(op.getLoc(), operands,
                                                         results);
@@ -2691,6 +2771,11 @@ MatmulConverter::matchAndRewrite(triton::DotOp op, OpAdaptor adaptor,
 
   auto replaceOp = [&](auto &&rewriter, ValueRange operands,
                        ValueRange results) -> Operation * {
+    if (explicitBatchMKN) {
+      Operation *batch = createOp(rewriter, operands, results);
+      rewriter.replaceOp(op, batch->getResults());
+      return batch;
+    }
     if (dstType.getRank() == 2)
       return rewriter.template replaceOpWithNewOp<linalg::MatmulOp>(
           op, operands, results);
@@ -2745,9 +2830,13 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
                      rhsElemType == triton::ScaleDotElemType::E5M2);
   bool isFP4Input = (lhsElemType == triton::ScaleDotElemType::E2M1) &&
                     (rhsElemType == triton::ScaleDotElemType::E2M1);
-  // MatMulMx consumes K-packed bytes and E8M0 scales. Its small-K
-  // decomposition requires at least 64 packed bytes (128 FP4 elements).
-  constexpr int64_t minimumNativeFp4StorageK = 64;
+  // Each E8M0 scale covers 32 consecutive elements along K. MatMulMx
+  // hardware requires K to span an integer number of 2-scale-block
+  // groups (64 elements for FP8, 64 packed bytes for FP4). K < this
+  // value or K not divisible by it should fall back to the software
+  // decomposed path rather than forming a native MatMulMxOp.
+  constexpr int64_t nativeMxKAlignment = 64;
+  constexpr int64_t minimumNativeFp4StorageK = nativeMxKAlignment;
   auto hasE8M0Scale = [](Value scale) {
     return !scale || cast<RankedTensorType>(scale.getType())
                          .getElementType()
@@ -2779,6 +2868,22 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
                    .getResult(0);
   }
   if (useNativeMx) {
+    auto lhsTy = cast<RankedTensorType>(lhs.getType());
+    auto rhsTy = cast<RankedTensorType>(rhs.getType());
+    int64_t lhsK = lhsTy.getShape()[1];
+    int64_t rhsK = rhsTy.getShape()[0];
+
+    if (!ShapedType::isDynamic(lhsK) && !ShapedType::isDynamic(rhsK)) {
+      if (lhsK != rhsK) {
+        return op.emitError()
+               << "MatMulMx: lhs K (" << lhsK << ") != rhs K (" << rhsK << ")";
+      }
+      if (lhsK % nativeMxKAlignment != 0) {
+        return op.emitError()
+               << "MatMulMx: static K = " << lhsK << ", must be divisible by "
+               << nativeMxKAlignment;
+      }
+    }
     if (!rhsScale) {
       auto rhsTy = cast<RankedTensorType>(rhs.getType());
       int64_t k = rhsTy.getDimSize(rhsTy.getRank() - 2);

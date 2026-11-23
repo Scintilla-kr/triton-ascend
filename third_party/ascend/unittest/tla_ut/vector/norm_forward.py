@@ -27,8 +27,10 @@ def rmsnorm(X_ptr, W_ptr, O_ptr, num_tokens, TMAX: tl.constexpr, HID: tl.constex
                      "HID must equal PAD_H (no tail DMA); PAD_H multiple of 256")
     tl.static_assert(NACC == PAD_H // 64 and CORES > 0 and TMAX > 0, "NACC must equal PAD_H // 64")
     # Route A: tile kernel pointer args directly via one tla.view(ptr) each.
-    x_ub = tla.alloc((1, PAD_H), tl.bfloat16, space="ub", versions=VERSIONS)
-    out_ub = tla.alloc((1, PAD_H), tl.float32, space="ub", versions=VERSIONS)
+    x_ub = tla.alloc((1, PAD_H), tl.bfloat16, space="ub")
+    out_ub = tla.alloc((1, PAD_H), tl.float32, space="ub")
+    tla.annotate_multi_buffer(x_ub, VERSIONS)
+    tla.annotate_multi_buffer(out_ub, VERSIONS)
     w_ub = tla.alloc((PAD_H, ), tl.bfloat16, space="ub")
     rstd_ub = tla.alloc((64, ), tl.float32, space="ub")
     for task in range(tl.program_id(0), num_tokens, CORES):
@@ -40,10 +42,10 @@ def rmsnorm(X_ptr, W_ptr, O_ptr, num_tokens, TMAX: tl.constexpr, HID: tl.constex
             tla.load_gm_to_ub(w_blk, w_ub)
         with tla.scope.simd():
             # UNPK_B16 reads 64 contiguous bf16 values into even sublanes.
-            ss = tla.simd.vsplat(0.0, tl.float32)
+            ss = tla.simd.vdup(0.0, tl.float32)
             for c in tl.static_range(PAD_H // 64):
                 a = tla.simd.vextf(tla.simd.vlds(x_ub[0, c * 64], dist="UNPK_B16"), tl.float32, part="part_even")
-                ss = tla.simd.vadd(ss, tla.simd.vreduce_sum(tla.simd.vmul(a, a)))
+                ss = tla.simd.vadd(ss, tla.simd.vcadd(tla.simd.vmul(a, a)))
             tla.simd.vsts(rstd_ub[0], ss, dist="ONEPT_B32")
             # SYNC-02: write-after-read barrier.
             tla.simd.membar("VST_VLD")

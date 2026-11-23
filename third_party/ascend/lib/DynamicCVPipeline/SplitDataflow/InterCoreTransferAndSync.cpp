@@ -263,21 +263,6 @@ static bool isValidC2CMatmulDependency(Value value, int consumerBlockId) {
   return hasAnyMatmulABInputUser(value, consumerBlockId);
 }
 
-bool hasStartEndSyncWhitelistKernel(ModuleOp module) {
-  std::vector<std::string> whitelist{
-      "_swa_bwd_dq_kernel",
-  };
-
-  bool isWhitelistKernel = false;
-  for (auto func : module.getOps<func::FuncOp>()) {
-    if (llvm::is_contained(whitelist, func.getName().str())) {
-      isWhitelistKernel = true;
-      break;
-    }
-  }
-  return isWhitelistKernel;
-}
-
 // Block Start/End Operation Retrieval
 std::pair<mlir::Operation *, mlir::Operation *>
 InterCoreTransferAndSyncPass::getBlockStartEnd(int targetId,
@@ -2124,9 +2109,9 @@ Operation *InterCoreTransferAndSyncPass::createC2CSharedL1Buffer(
 }
 
 // C->C Transfer Logic
-LogicalResult
-InterCoreTransferAndSyncPass::handleCubeToCube(OpBuilder &builder,
-                                               DependencyInfo &dep) {
+LogicalResult InterCoreTransferAndSyncPass::handleCubeToCube(
+    OpBuilder &builder, DependencyInfo &dep,
+    llvm::SmallSetVector<Operation *, 4> &foldedCasts) {
   mlir::Value transferValue = dep.value;
   Location loc = transferValue.getLoc();
 
@@ -2253,10 +2238,8 @@ InterCoreTransferAndSyncPass::handleCubeToCube(OpBuilder &builder,
     }
   }
 
-  // Erase the trunc op after all uses are replaced (dead code elimination).
-  if (truncOp && CVPipeline::getFixpipePreQuantMode(truncOp).has_value()) {
-    truncOp->erase();
-  }
+  if (quantMode)
+    foldedCasts.insert(truncOp);
 
   intraDepsGroupId++;
   LOG_DEBUG("Inserted C->C fixpipe transfer: block "
@@ -2533,6 +2516,7 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(
   }
   LOG_DEBUG("Completed C->V transfers and syncs.\n");
 
+  llvm::SmallSetVector<Operation *, 4> foldedCasts;
   // Step 3.1: Handle inter-block C->C dependencies (fixpipe L0C to L1)
   llvm::SmallVector<DependencyInfo> &C2CDependencies =
       info.getC2CDependencies();
@@ -2547,7 +2531,7 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(
     if (!isValidC2CMatmulDependency(dep.value, dep.consumerBlockId)) {
       continue;
     }
-    if (failed(handleCubeToCube(builder, dep))) {
+    if (failed(handleCubeToCube(builder, dep, foldedCasts))) {
       LOG_DEBUG("[ERROR] Inter C->C failed! producerBlockId = "
                 << dep.producerBlockId
                 << ", consumerBlockId = " << dep.consumerBlockId << "\n");
@@ -2576,7 +2560,7 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(
             static_cast<unsigned>(consumerMatmul.getNumDpsInputs())) {
       continue;
     }
-    if (failed(handleCubeToCube(builder, dep))) {
+    if (failed(handleCubeToCube(builder, dep, foldedCasts))) {
       LOG_DEBUG("[ERROR] IntraC2C failed! producer and consumer' BlockId = "
                 << dep.consumerBlockId << "\n");
       return failure();
@@ -2603,6 +2587,11 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(
     }
   }
   LOG_DEBUG("Completed memory syncs.\n");
+
+  // A cast can be shared by several dependencies or retain other users.
+  for (Operation *castOp : foldedCasts)
+    if (castOp->use_empty())
+      castOp->erase();
   LOG_DEBUG("=====================================================\n");
 
   if (!flagManager.checkCurrentId()) {

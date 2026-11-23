@@ -33,7 +33,10 @@
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/SetVector.h"
+#include <algorithm>
 #include <iterator>
+#include <limits>
+#include <tuple>
 
 using namespace mlir;
 namespace mlir::triton {
@@ -198,9 +201,9 @@ static void trySetAddPtrViewInsertionPoint(
     rewriter.restoreInsertionPoint(original);
 }
 
-static FailureOr<Value> materializeMemoryPointer(
-    const ptr::PtrInfo &info, Location loc, ConversionPatternRewriter &rewriter,
-    OpFoldResult remappedOrigin = {}, triton::AddPtrOp viewAnchor = {}) {
+static FailureOr<Value>
+resolveMemoryPointerBase(const ptr::PtrInfo &info,
+                         ConversionPatternRewriter &rewriter) {
   Value sourceBase = info.base;
   if (auto bridge = sourceBase.getDefiningOp<UnrealizedConversionCastOp>();
       bridge && bridge.getInputs().size() == 1 &&
@@ -216,9 +219,18 @@ static FailureOr<Value> materializeMemoryPointer(
       break;
     base = cast.getInputs()[0];
   }
-  auto baseType = dyn_cast<MemRefType>(base.getType());
-  if (!baseType)
+  if (!isa<MemRefType>(base.getType()))
     return failure();
+  return base;
+}
+
+static FailureOr<Value>
+materializeMemoryPointer(const ptr::PtrInfo &info, Value base,
+                         ArrayRef<OpFoldResult> remappedStrides, Location loc,
+                         ConversionPatternRewriter &rewriter,
+                         OpFoldResult remappedOrigin = {},
+                         triton::AddPtrOp viewAnchor = {}) {
+  auto baseType = cast<MemRefType>(base.getType());
   // A scalar base with no displacement already denotes the requested address.
   // Reusing it also preserves the complete-address fold for int_to_ptr.
   if (info.offsets.getShape().empty() && baseType.getRank() == 1 &&
@@ -240,13 +252,20 @@ static FailureOr<Value> materializeMemoryPointer(
                      : remap(info.offsets.scalarOffset, rewriter),
       loc, rewriter, rewriter.getIndexType());
   SmallVector<OpFoldResult> sizes, strides;
-  for (auto [size, axis] :
-       llvm::zip_equal(info.offsets.getShape(), info.offsets.axes)) {
+  for (auto [size, stride] :
+       llvm::zip_equal(info.offsets.getShape(), remappedStrides)) {
     if (ShapedType::isDynamic(size))
       return failure();
     sizes.push_back(rewriter.getIndexAttr(size));
-    strides.push_back(size == 1 ? rewriter.getIndexAttr(1)
-                                : remap(axis.stride, rewriter));
+    if (size == 1) {
+      // DMA uses the physical pitch to select a transfer for block views,
+      // even when the tile touches only one position along this axis.
+      OpFoldResult one = rewriter.getIndexAttr(1);
+      strides.push_back(info.block ? maxOpFoldResult(stride, one, loc, rewriter)
+                                   : one);
+    } else {
+      strides.push_back(stride);
+    }
   }
   if (sizes.empty()) {
     sizes.push_back(rewriter.getIndexAttr(1));
@@ -303,8 +322,14 @@ FailureOr<Value> materializeMemoryPointer(Value pointer, Value converted,
     if (element && !isa<ShapedType>(element.getPointeeType()))
       viewAnchor = pointer.getDefiningOp<triton::AddPtrOp>();
   }
+  auto base = resolveMemoryPointerBase(info, rewriter);
+  if (failed(base))
+    return failure();
+  SmallVector<OpFoldResult> strides;
+  for (const auto &axis : info.offsets.axes)
+    strides.push_back(remap(axis.stride, rewriter));
   Location loc = pointer.getLoc();
-  return materializeMemoryPointer(info, loc, rewriter,
+  return materializeMemoryPointer(info, *base, strides, loc, rewriter,
                                   /*remappedOrigin=*/{}, viewAnchor);
 }
 
@@ -361,39 +386,172 @@ FailureOr<BoundaryCheckedPointer> materializeBoundaryCheckedMemoryPointer(
     checkedCoordinates.push_back(coordinate);
   }
 
-  Location loc = pointer.getLoc();
-  SmallVector<OpFoldResult> coordinates;
+  auto remappedBase = resolveMemoryPointerBase(info, rewriter);
+  if (failed(remappedBase))
+    return failure();
+  OpFoldResult origin = remap(baseInfo.offsets.scalarOffset, rewriter);
+  SmallVector<OpFoldResult> coordinates, strides;
   for (OpFoldResult coordinate : info.block->coordinateOffsets)
     coordinates.push_back(remap(coordinate, rewriter));
-  Value zero = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
-  for (auto [axis, coordinate] : llvm::zip_equal(checks, checkedCoordinates)) {
-    Value clamped = rewriter.create<arith::MaxSIOp>(loc, coordinate, zero);
-    coordinates[axis] =
-        rewriter
-            .create<arith::IndexCastOp>(loc, rewriter.getIndexType(), clamped)
-            .getResult();
+  for (const auto &axis : info.offsets.axes)
+    strides.push_back(remap(axis.stride, rewriter));
+
+  SmallVector<Value> dependencies{*remappedBase};
+  auto addDependency = [&](OpFoldResult field) {
+    if (auto value = dyn_cast<Value>(field))
+      dependencies.push_back(value);
+  };
+  addDependency(origin);
+  for (auto [axis, coordinate] : llvm::enumerate(coordinates))
+    if (!llvm::is_contained(checks, static_cast<int32_t>(axis)))
+      addDependency(coordinate);
+  llvm::append_range(dependencies, checkedCoordinates);
+  for (OpFoldResult stride : strides)
+    addDependency(stride);
+
+  // Match producer-local block views from the legacy lowering. Moving only
+  // the cast leaves its clamped origin at the access and cannot restore this
+  // order. The complete remapped inputs must dominate the same-block anchor;
+  // otherwise keep the view and its address arithmetic at the access.
+  OpBuilder::InsertionGuard guard(rewriter);
+  auto original = rewriter.saveInsertionPoint();
+  Block *block = original.getBlock();
+  if (make->getBlock() == block &&
+      (original.getPoint() == block->end() ||
+       make->isBeforeInBlock(&*original.getPoint()))) {
+    // Insert before the retained producer so multiple accesses append their
+    // view construction in order, without moving any memory operation.
+    rewriter.setInsertionPoint(make);
+    if (failed(ptr::checkInsertionPoint(rewriter, dependencies)))
+      rewriter.restoreInsertionPoint(original);
   }
 
-  OpFoldResult origin = remap(baseInfo.offsets.scalarOffset, rewriter);
-  for (auto [coordinate, axis] :
-       llvm::zip_equal(coordinates, info.offsets.axes)) {
+  Location loc = pointer.getLoc();
+  Value zero;
+  SmallVector<ClampedPointerAxis> clampedAxes;
+  for (auto [axis, coordinate] : llvm::zip_equal(checks, checkedCoordinates)) {
+    OpFoldResult gmCoordinate;
+    if (auto constant = getConstantIntValue(coordinates[axis])) {
+      // Boundary sizes must retain static axes for unit-axis load/store guards.
+      gmCoordinate = rewriter.getIndexAttr(std::max<int64_t>(0, *constant));
+    } else {
+      if (!zero)
+        zero = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
+      Value clamped = rewriter.create<arith::MaxSIOp>(loc, coordinate, zero);
+      gmCoordinate =
+          rewriter
+              .create<arith::IndexCastOp>(loc, rewriter.getIndexType(), clamped)
+              .getResult();
+    }
+    coordinates[axis] = gmCoordinate;
+    clampedAxes.push_back({axis, gmCoordinate});
+  }
+
+  for (auto [coordinate, stride] : llvm::zip_equal(coordinates, strides)) {
     // A unit tile axis may have memref stride 1; its address contribution
     // must still use the original descriptor stride.
-    auto contribution =
-        mulOpFoldResult(coordinate, remap(axis.stride, rewriter), loc, rewriter,
-                        rewriter.getIndexType());
+    auto contribution = mulOpFoldResult(coordinate, stride, loc, rewriter,
+                                        rewriter.getIndexType());
     origin = addOpFoldResult(origin, contribution, loc, rewriter,
                              rewriter.getIndexType());
   }
-  auto view = materializeMemoryPointer(info, loc, rewriter, origin);
+  auto view = materializeMemoryPointer(info, *remappedBase, strides, loc,
+                                       rewriter, origin);
   if (failed(view))
     return failure();
-  return BoundaryCheckedPointer{*view, llvm::to_vector(checks)};
+  return BoundaryCheckedPointer{*view, std::move(clampedAxes)};
 }
 
-FailureOr<MemoryBoundary> getMemoryBoundary(
-    Value pointer, ArrayRef<int32_t> checks, ArrayRef<int32_t> zeroBasedAxes,
-    const MemoryPointerInfos &infos, ConversionPatternRewriter &rewriter) {
+// Both parent - coordinate and parent - max(coordinate, 0) must fit in
+// index64. Checked GM coordinates come from i32; keep the old expression
+// when the parent's range cannot be proven without an integer-range analysis.
+static bool hasSafeBoundaryDifference(OpFoldResult parent) {
+  if (auto constant = getConstantIntValue(parent)) {
+    constexpr int64_t minParent = std::numeric_limits<int64_t>::min() +
+                                  std::numeric_limits<int32_t>::max();
+    constexpr int64_t maxParent = std::numeric_limits<int64_t>::max() +
+                                  std::numeric_limits<int32_t>::min();
+    return *constant >= minParent && *constant <= maxParent;
+  }
+  Value value = dyn_cast<Value>(parent);
+  while (value) {
+    if (auto type = dyn_cast<IntegerType>(value.getType());
+        type && type.getWidth() <= 32)
+      return true;
+    if (auto cast = value.getDefiningOp<arith::IndexCastOp>())
+      value = cast.getIn();
+    else if (auto ext = value.getDefiningOp<arith::ExtSIOp>())
+      value = ext.getIn();
+    else
+      break;
+  }
+  return false;
+}
+
+// Return the local slice offset and length for one checked tile axis.
+static std::pair<OpFoldResult, OpFoldResult>
+getCheckedTileSlice(OpFoldResult coordinate, OpFoldResult parent,
+                    OpFoldResult gmCoordinate, int64_t extent, Location loc,
+                    OpBuilder &builder) {
+  OpFoldResult zero = builder.getIndexAttr(0);
+  OpFoldResult tile = builder.getIndexAttr(extent);
+  bool useGmStart = gmCoordinate && hasSafeBoundaryDifference(parent);
+  if (useGmStart && extent > 1 && !getConstantIntValue(coordinate) &&
+      ptr::detail::isKnownMultiple(coordinate, extent)) {
+    // A negative aligned coordinate puts the entire tile before the parent.
+    // Every nonempty transfer therefore starts at local offset zero.
+    Value x = cast<Value>(coordinate);
+    Value zeroValue = builder.create<arith::ConstantIndexOp>(loc, 0);
+    Value active;
+    Value count;
+    if (auto bound = getConstantIntValue(parent);
+        bound && *bound > 0 && *bound % extent == 0) {
+      // An aligned parent also rules out a partial right edge.
+      Value limit = builder.create<arith::ConstantIndexOp>(loc, *bound);
+      active = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, x,
+                                             limit);
+      count = builder.create<arith::ConstantIndexOp>(loc, extent);
+    } else {
+      active = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, x,
+                                             zeroValue);
+      auto available = maxOpFoldResult(
+          zero, subOpFoldResult(parent, gmCoordinate, loc, builder), loc,
+          builder);
+      count = getValueOrCreateConstantIndexOp(
+          builder, loc, minOpFoldResult(available, tile, loc, builder));
+    }
+    return {zero, builder.create<arith::SelectOp>(loc, active, count, zeroValue)
+                      .getResult()};
+  }
+
+  auto start = minOpFoldResult(
+      tile,
+      maxOpFoldResult(zero, subOpFoldResult(zero, coordinate, loc, builder),
+                      loc, builder),
+      loc, builder);
+  if (useGmStart) {
+    // For x=-2, parent=5, tile=32 this copies 5 elements into lanes [2,7).
+    auto available = maxOpFoldResult(
+        zero, subOpFoldResult(parent, gmCoordinate, loc, builder), loc,
+        builder);
+    auto capacity = subOpFoldResult(tile, start, loc, builder);
+    return {start, minOpFoldResult(available, capacity, loc, builder)};
+  }
+  auto end = minOpFoldResult(
+      tile,
+      maxOpFoldResult(zero, subOpFoldResult(parent, coordinate, loc, builder),
+                      loc, builder),
+      loc, builder);
+  return {start,
+          maxOpFoldResult(zero, subOpFoldResult(end, start, loc, builder), loc,
+                          builder)};
+}
+
+FailureOr<MemoryBoundary>
+getMemoryBoundary(Value pointer, ArrayRef<int32_t> checks,
+                  ArrayRef<ClampedPointerAxis> clampedAxes,
+                  const MemoryPointerInfos &infos,
+                  ConversionPatternRewriter &rewriter) {
   auto found = infos.find(pointer);
   if (found == infos.end() || !found->second.block)
     return failure();
@@ -404,29 +562,23 @@ FailureOr<MemoryBoundary> getMemoryBoundary(
   for (auto [dim, extent] : llvm::enumerate(info.offsets.getShape())) {
     OpFoldResult size = rewriter.getIndexAttr(extent);
     OpFoldResult start = zero;
-    if (llvm::is_contained(checks, static_cast<int32_t>(dim))) {
+    const int32_t axisNumber = static_cast<int32_t>(dim);
+    auto clampedAxis =
+        llvm::find_if(clampedAxes, [axisNumber](const auto &axis) {
+          return axis.axis == axisNumber;
+        });
+    OpFoldResult gmCoordinate = clampedAxis != clampedAxes.end()
+                                    ? clampedAxis->coordinate
+                                    : OpFoldResult{};
+    if (llvm::is_contained(checks, axisNumber)) {
       OpFoldResult coordinate =
           remap(info.block->coordinateOffsets[dim], rewriter);
       OpFoldResult parent = remap(info.block->parentShape[dim], rewriter);
-      start = minOpFoldResult(
-          size,
-          maxOpFoldResult(zero,
-                          subOpFoldResult(zero, coordinate, loc, rewriter), loc,
-                          rewriter),
-          loc, rewriter);
-      auto end = minOpFoldResult(
-          size,
-          maxOpFoldResult(zero,
-                          subOpFoldResult(parent, coordinate, loc, rewriter),
-                          loc, rewriter),
-          loc, rewriter);
-      size = maxOpFoldResult(zero, subOpFoldResult(end, start, loc, rewriter),
-                             loc, rewriter);
+      std::tie(start, size) = getCheckedTileSlice(
+          coordinate, parent, gmCoordinate, extent, loc, rewriter);
     }
     boundary.tileStarts.push_back(start);
-    boundary.gmStarts.push_back(
-        llvm::is_contained(zeroBasedAxes, static_cast<int32_t>(dim)) ? zero
-                                                                     : start);
+    boundary.gmStarts.push_back(gmCoordinate ? zero : start);
     boundary.sizes.push_back(size);
   }
   return boundary;

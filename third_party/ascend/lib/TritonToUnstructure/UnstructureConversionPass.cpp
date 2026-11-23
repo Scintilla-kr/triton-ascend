@@ -36,6 +36,7 @@
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
@@ -811,56 +812,67 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
     ptrOffset = *full;
   }
 
-  // Handle these accesses before any speculative fallback IR is created.
-  // A failed match must leave the original operation intact for the final
-  // unsupported-mask diagnostic, without repeatedly inserting dead helpers.
-  if (runtimeLoopMask) {
-    if constexpr (std::is_same_v<MemAccOpTy, triton::LoadOp> ||
-                  std::is_same_v<MemAccOpTy, triton::StoreOp>) {
-      // A one-element tensor needs only a scalar predicate, including in SIMD
-      // mode. Use explicit control flow: the legacy scalar masked-load
-      // converter otherwise loads unconditionally and selects afterwards.
-      if (ptrType.getNumElements() == 1 &&
-          getResultElementType(ptrType).isIntOrFloat() &&
-          canUseIndirectFastPath(srcPtr, ptrOffset)) {
-        SmallVector<OpFoldResult> indices(ptrType.getRank(),
-                                          rewriter.getIndexAttr(0));
-        Value offset = createExtractOp(loc, ptrOffset, rewriter, indices);
-        Value base = srcPtr;
-        Value scalarPtr = rewriter.create<triton::AddPtrOp>(loc, base.getType(),
-                                                            base, offset);
-        Value mask = createExtractOp(loc, op.getMask(), rewriter, indices);
-        if constexpr (std::is_same_v<MemAccOpTy, triton::LoadOp>) {
-          Value other = createExtractOp(loc, op.getOther(), rewriter, indices);
-          if (!other)
-            other = rewriter.create<arith::ConstantOp>(
-                loc, rewriter.getZeroAttr(getResultElementType(ptrType)));
-          auto guardedLoad = rewriter.create<scf::IfOp>(
-              loc, mask,
-              [&](OpBuilder &b, Location loc) {
-                auto load =
-                    b.create<triton::LoadOp>(loc, scalarPtr, op.getCache(),
-                                             op.getEvict(), op.getIsVolatile());
-                b.create<scf::YieldOp>(loc, load.getResult());
-              },
-              [&](OpBuilder &b, Location loc) {
-                b.create<scf::YieldOp>(loc, other);
-              });
-          rewriter.replaceOpWithNewOp<triton::SplatOp>(
-              op, op.getType(), guardedLoad.getResult(0));
-        } else {
-          Value value = createExtractOp(loc, op.getValue(), rewriter, indices);
-          rewriter.create<scf::IfOp>(
-              loc, mask, [&](OpBuilder &b, Location loc) {
-                b.create<triton::StoreOp>(loc, scalarPtr, value, op.getCache(),
-                                          op.getEvict());
-                b.create<scf::YieldOp>(loc);
-              });
-          rewriter.eraseOp(op);
-        }
-        return success();
-      }
+  // A single lane needs only a scalar predicate. Keep the access inside the
+  // true branch so a masked-off pointer is never dereferenced.
+  if constexpr (std::is_same_v<MemAccOpTy, triton::LoadOp> ||
+                std::is_same_v<MemAccOpTy, triton::StoreOp>) {
+    bool scalarizeMask = runtimeLoopMask;
+    if constexpr (std::is_same_v<MemAccOpTy, triton::LoadOp>) {
+      // The ordinary discrete-mask fast path uses scalar numeric loads. Bool
+      // storage normalization and volatile access retain their existing path.
+      scalarizeMask =
+          scalarizeMask ||
+          (mixCompileDiscreteMask && op.getMask() && !info.block &&
+           ptrType.hasStaticShape() && ptrType.getNumElements() == 1 &&
+           !op.getIsVolatile() && !getResultElementType(ptrType).isInteger(1) &&
+           !op->hasAttr("was_bool_to_int8") &&
+           !ConverterUtils::requiresVolatileIndirectLoad(op.getPtr(), op));
     }
+    if (scalarizeMask && ptrType.hasStaticShape() &&
+        ptrType.getNumElements() == 1 &&
+        getResultElementType(ptrType).isIntOrFloat() &&
+        canUseIndirectFastPath(srcPtr, ptrOffset)) {
+      SmallVector<OpFoldResult> indices(ptrType.getRank(),
+                                        rewriter.getIndexAttr(0));
+      Value offset = createExtractOp(loc, ptrOffset, rewriter, indices);
+      Value base = srcPtr;
+      Value scalarPtr =
+          rewriter.create<triton::AddPtrOp>(loc, base.getType(), base, offset);
+      Value mask = createExtractOp(loc, op.getMask(), rewriter, indices);
+      if constexpr (std::is_same_v<MemAccOpTy, triton::LoadOp>) {
+        Value other = createExtractOp(loc, op.getOther(), rewriter, indices);
+        if (!other)
+          other = rewriter.create<arith::ConstantOp>(
+              loc, rewriter.getZeroAttr(getResultElementType(ptrType)));
+        auto guardedLoad = rewriter.create<scf::IfOp>(
+            loc, mask,
+            [&](OpBuilder &b, Location loc) {
+              auto load =
+                  b.create<triton::LoadOp>(loc, scalarPtr, op.getCache(),
+                                           op.getEvict(), op.getIsVolatile());
+              b.create<scf::YieldOp>(loc, load.getResult());
+            },
+            [&](OpBuilder &b, Location loc) {
+              b.create<scf::YieldOp>(loc, other);
+            });
+        rewriter.replaceOpWithNewOp<triton::SplatOp>(op, op.getType(),
+                                                     guardedLoad.getResult(0));
+      } else {
+        Value value = createExtractOp(loc, op.getValue(), rewriter, indices);
+        rewriter.create<scf::IfOp>(loc, mask, [&](OpBuilder &b, Location loc) {
+          b.create<triton::StoreOp>(loc, scalarPtr, value, op.getCache(),
+                                    op.getEvict());
+          b.create<scf::YieldOp>(loc);
+        });
+        rewriter.eraseOp(op);
+      }
+      return success();
+    }
+  }
+
+  // Runtime loop masks have a stricter fallback contract. Ordinary discrete
+  // masks that did not scalarize continue through the existing paths below.
+  if (runtimeLoopMask) {
     if (compileOn91095Flag &&
         triton::ascend::isSimtTemplateMode(unstructureCompileMode) &&
         succeeded(tryRewriteIndirectFastPath(op, loc, srcPtr, ptrOffset,
@@ -1000,11 +1012,69 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
   });
 
   Value iterArg = nullptr;
+  Value destinationPadding;
+  if constexpr (std::is_same_v<MemAccOpTy, triton::LoadOp>) {
+    ModuleOp module = op->template getParentOfType<ModuleOp>();
+    auto owner =
+        module ? module->getAttrOfType<StringAttr>("hacc.block_mapping_owner")
+               : StringAttr{};
+    // Preserve the existing padding path for kernels that were not batched.
+    bool isBlockBatched = owner && owner.getValue() == "block_batching";
+    // Prefix masks on partially structured loads can initialize the final
+    // destination directly. Loop bounds protect indirect axes; the sliced
+    // load below protects retained axes and supplies their inactive values.
+    // A fresh destination is essential: reusing the constant `other` tensor
+    // can introduce a copy when bufferization sees multiple padded dot inputs.
+    // LoadConverter carries this fill onto the actual allocation used by DMA.
+    // Keep the existing select path for unknown/non-prefix masks, arbitrary
+    // tensor other values, scalar fallback and nonzero padding.
+    if (isBlockBatched && isLoadLike && op.getMask() && op.getOther() &&
+        mstate && mstate->isMask() &&
+        mstate->dims.size() == resultShape.size() &&
+        mstate->offsets.size() == resultShape.size() &&
+        llvm::any_of(llvm::zip_equal(structuredAxes, resultShape),
+                     [](auto axis) {
+                       auto [structured, size] = axis;
+                       return structured && size > 1;
+                     }) &&
+        llvm::all_of(mstate->offsets, [](OpFoldResult offset) {
+          return isConstantIntValue(offset, 0);
+        })) {
+      Value padding = op.getOther();
+      while (auto *def = padding.getDefiningOp()) {
+        if (!isa<triton::SplatOp, triton::BroadcastOp, triton::ExpandDimsOp>(
+                def))
+          break;
+        padding = def->getOperand(0);
+      }
+      Attribute attr;
+      if (matchPattern(padding, m_Constant(&attr)) &&
+          (matchPattern(padding, m_Zero()) ||
+           matchPattern(padding, m_AnyZeroFloat()))) {
+        if (auto dense = dyn_cast<DenseElementsAttr>(attr)) {
+          if (dense.isSplat())
+            attr = dense.getSplatValue<Attribute>();
+        }
+        if (isa<FloatAttr, IntegerAttr>(attr))
+          destinationPadding =
+              rewriter.create<arith::ConstantOp>(loc, cast<TypedAttr>(attr));
+      }
+    }
+  }
 
   // Only load case
   if (isLoadLike) {
-    iterArg =
-        rewriter.create<tensor::EmptyOp>(loc, resultShape, resultElementType);
+    if (destinationPadding) {
+      Value empty =
+          rewriter.create<tensor::EmptyOp>(loc, resultShape, resultElementType);
+      iterArg = rewriter
+                    .create<linalg::FillOp>(loc, ValueRange{destinationPadding},
+                                            ValueRange{empty})
+                    .getResult(0);
+    } else {
+      iterArg =
+          rewriter.create<tensor::EmptyOp>(loc, resultShape, resultElementType);
+    }
   }
   Value newOpResult = nullptr;
 
@@ -1180,9 +1250,22 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
       if (residualMask) {
         accessedOp.getMaskMutable().assign(createExtractOp(
             loc, residualMask, rewriter, offsets, sizes, strides));
+        if (destinationPadding) {
+          Value other = rewriter.create<triton::SplatOp>(loc, extractedType,
+                                                         destinationPadding);
+          accessedOp.getOtherMutable().assign(other);
+        } else {
+          // The outer select restores padding after all slices are assembled.
+          // Keep nonuniform padding for the deinterleave lowering contract.
+          DenseElementsAttr other;
+          if (op.getOther() &&
+              matchPattern(op.getOther(), m_Constant(&other)) &&
+              other.isSplat())
+            accessedOp.getOtherMutable().clear();
+        }
       } else {
         // The loop bounds enforce the complete mask. Padding for unvisited
-        // elements remains in the outer select below.
+        // elements remains in the destination fill or outer select below.
         accessedOp.getMaskMutable().clear();
         accessedOp.getOtherMutable().clear();
       }
@@ -1218,7 +1301,7 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
                   UnitAttr::get(rewriter.getContext()));
     rewriter.restoreInsertionPoint(insertPoint);
     if constexpr (std::is_same_v<MemAccOpTy, triton::LoadOp>) {
-      if (op.getMask() && op.getOther()) {
+      if (op.getMask() && op.getOther() && !destinationPadding) {
         rewriter
             .replaceOpWithNewOp<arith::SelectOp>(op, op.getMask(), newOpResult,
                                                  op.getOther())

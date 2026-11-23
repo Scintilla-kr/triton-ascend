@@ -13,10 +13,10 @@
 // CHECK: %[[CLAMPED:.*]] = arith.index_cast %[[CLAMPED32]] : i32 to index
 // CHECK: %[[OFFSET:.*]] = arith.muli %[[CLAMPED]], %[[STRIDE]] : index
 // CHECK: %[[INPUT:.*]] = memref.reinterpret_cast %[[SRC]] to offset: [%[[OFFSET]]], sizes: [8, 16], strides: [16, 1]
+// CHECK: %[[OUTPUT:.*]] = memref.reinterpret_cast %[[DST]] to offset: [%[[OFFSET]]], sizes: [8, 16], strides: [16, 1]
 // CHECK: %[[GM_READ:.*]] = memref.subview %[[INPUT]][0, 0] [%[[COUNT:.*]], 16] [1, 1]
 // CHECK: %[[UB_WRITE:.*]] = memref.subview %{{.*}}[%[[START:.*]], 0] [%[[COUNT]], 16] [1, 1]
 // CHECK: memref.copy %[[GM_READ]], %[[UB_WRITE]]
-// CHECK: %[[OUTPUT:.*]] = memref.reinterpret_cast %[[DST]] to offset: [%[[OFFSET]]], sizes: [8, 16], strides: [16, 1]
 // CHECK: %[[UB_READ:.*]] = tensor.extract_slice %{{.*}}[%[[START]], 0] [%[[COUNT]], 16] [1, 1]
 // CHECK: %[[GM_WRITE:.*]] = memref.subview %[[OUTPUT]][0, 0] [%[[COUNT]], 16] [1, 1]
 // CHECK: bufferization.materialize_in_destination %[[UB_READ]] in writable %[[GM_WRITE]]
@@ -39,14 +39,12 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 // The valid source addresses are src+[17,18,19,20], and the destinations
 // are dst+[29,30,31,32]. Neither scalar base displacement may be added twice.
 // CHECK-LABEL: func.func @negative_prefix_preserves_base
-// CHECK-DAG: %[[SRC_OFFSET:.*]] = arith.constant 17 : index
-// CHECK-DAG: %[[DST_OFFSET:.*]] = arith.constant 29 : index
-// CHECK: %[[INPUT:.*]] = memref.reinterpret_cast {{.*}} to offset: [%[[SRC_OFFSET]]], sizes: [8], strides: [1]
+// CHECK: %[[INPUT:.*]] = memref.reinterpret_cast {{.*}} to offset: [17], sizes: [8], strides: [1]
+// CHECK: %[[OUTPUT:.*]] = memref.reinterpret_cast {{.*}} to offset: [29], sizes: [8], strides: [1]
 // CHECK: linalg.fill
 // CHECK: %[[GM_READ:.*]] = memref.subview %[[INPUT]][0] [4] [1]
 // CHECK: %[[UB_WRITE:.*]] = memref.subview %{{.*}}[2] [4] [1]
 // CHECK: memref.copy %[[GM_READ]], %[[UB_WRITE]]
-// CHECK: %[[OUTPUT:.*]] = memref.reinterpret_cast {{.*}} to offset: [%[[DST_OFFSET]]], sizes: [8], strides: [1]
 // CHECK: %[[UB_READ:.*]] = tensor.extract_slice %{{.*}}[2] [4] [1]
 // CHECK: %[[GM_WRITE:.*]] = memref.subview %[[OUTPUT]][0] [4] [1]
 // CHECK: bufferization.materialize_in_destination %[[UB_READ]] in writable %[[GM_WRITE]]
@@ -73,8 +71,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 // 20 + (-1)*16 + max(-2,0) = 4. The two valid columns occupy UB [0,2].
 // Clamping both coordinates would incorrectly change the origin to 20.
 // CHECK-LABEL: func.func @unchecked_negative_axis
-// CHECK: %[[OFFSET:.*]] = arith.constant 4 : index
-// CHECK: %[[INPUT:.*]] = memref.reinterpret_cast {{.*}} to offset: [%[[OFFSET]]], sizes: [2, 4], strides: [16, 1]
+// CHECK: %[[INPUT:.*]] = memref.reinterpret_cast {{.*}} to offset: [4], sizes: [2, 4], strides: [16, 1]
 // CHECK: %[[GM:.*]] = memref.subview %[[INPUT]][0, 0] [2, 2] [1, 1]
 // CHECK: %[[UB:.*]] = memref.subview %{{.*}}[0, 2] [2, 2] [1, 1]
 // CHECK: memref.copy %[[GM]], %[[UB]]
@@ -104,12 +101,11 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 // The zero-stride load reads its one address into the same four logical lanes.
 // Bounds depend on coordinates even when the physical stride is zero.
 // CHECK-LABEL: func.func @nonpositive_strides
-// CHECK: %[[OFFSET:.*]] = arith.constant 31 : index
-// CHECK: %[[NEG:.*]] = memref.reinterpret_cast {{.*}} to offset: [%[[OFFSET]]], sizes: [8], strides: [-2]
+// CHECK: %[[NEG:.*]] = memref.reinterpret_cast {{.*}} to offset: [31], sizes: [8], strides: [-2]
+// CHECK: %[[ZERO:.*]] = memref.reinterpret_cast {{.*}} to offset: [0], sizes: [8], strides: [0]
 // CHECK: %[[NEG_GM:.*]] = memref.subview %[[NEG]][0] [4] [1]
 // CHECK: %[[NEG_UB:.*]] = memref.subview %{{.*}}[2] [4] [1]
 // CHECK: memref.copy %[[NEG_GM]], %[[NEG_UB]]
-// CHECK: %[[ZERO:.*]] = memref.reinterpret_cast {{.*}} to offset: [0], sizes: [8], strides: [0]
 // CHECK: %[[ZERO_GM:.*]] = memref.subview %[[ZERO]][0] [4] [1]
 // CHECK: %[[ZERO_UB:.*]] = memref.subview %{{.*}}[2] [4] [1]
 // CHECK: memref.copy %[[ZERO_GM]], %[[ZERO_UB]]
@@ -137,8 +133,8 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 
 // -----
 
-// A one-row memref can use normalized stride 1 on its unit axis, but its
-// absolute origin must retain the descriptor's row stride of 4096.
+// A one-row block view retains the descriptor stride of 4096 both in its
+// absolute origin and in the memref layout consumed by DMA.
 // The existing size==1 guard must still protect the complete static store.
 // CHECK-LABEL: func.func @unit_row_keeps_descriptor_stride(
 // CHECK-SAME: %[[BASE:[^ ,]+]]: memref<?xf32>
@@ -148,7 +144,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 // CHECK: %[[CLAMPED32:.*]] = arith.maxsi %[[ROW]], %[[ZERO32]] : i32
 // CHECK: %[[CLAMPED:.*]] = arith.index_cast %[[CLAMPED32]] : i32 to index
 // CHECK: %[[OFFSET:.*]] = arith.muli %[[CLAMPED]], %[[STRIDE]] : index
-// CHECK: %[[VIEW:.*]] = memref.reinterpret_cast %[[BASE]] to offset: [%[[OFFSET]]], sizes: [1, 4096]
+// CHECK: %[[VIEW:.*]] = memref.reinterpret_cast %[[BASE]] to offset: [%[[OFFSET]]], sizes: [1, 4096], strides: [4096, 1]
 // CHECK: %[[ACTIVE:.*]] = arith.cmpi eq,
 // CHECK: scf.if %[[ACTIVE]] {
 // CHECK-NOT: tensor.extract_slice
@@ -164,6 +160,30 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
     %data = arith.constant dense<7.0> : tensor<1x4096xf32>
     %p = tt.make_tensor_ptr %base, [%rows, %cols], [%cols, %one], [%row, %zero] {order = array<i32: 1, 0>} : <tensor<1x4096xf32>>
     tt.store %p, %data {boundaryCheck = array<i32: 0, 1>} : !tt.ptr<tensor<1x4096xf32>>
+    tt.return
+  }
+}
+
+// -----
+
+// The plane coordinate still scales by the original pitch. A positive
+// memref stride describes the same single plane even for nonpositive pitches.
+// CHECK-LABEL: func.func @unit_plane_dma_pitch(
+// CHECK-SAME: %[[Q:[^ ,]+]]: memref<?xbf16>
+// CHECK-SAME: %[[PITCH:[^ ,]+]]: i64
+// CHECK-DAG: %[[ONE:.*]] = arith.constant 1 : index
+// CHECK-DAG: %[[PITCH_IDX:.*]] = arith.index_cast %[[PITCH]] : i64 to index
+// CHECK: %[[SAFE_PITCH:.*]] = arith.maxsi %[[PITCH_IDX]], %[[ONE]] : index
+// CHECK: memref.reinterpret_cast %[[Q]] to offset: [{{.*}}], sizes: [1, 16, 128], strides: [%[[SAFE_PITCH]], 128, 1]
+module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
+  tt.func public @unit_plane_dma_pitch(%base: !tt.ptr<bf16>, %pitch: i64, %row: i32, %rows: i64) {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i64
+    %heads = arith.constant 16 : i64
+    %width = arith.constant 128 : i64
+    %data = arith.constant dense<2.0> : tensor<1x16x128xbf16>
+    %p = tt.make_tensor_ptr %base, [%rows, %heads, %width], [%pitch, %width, %one], [%row, %zero, %zero] {order = array<i32: 2, 1, 0>} : <tensor<1x16x128xbf16>>
+    tt.store %p, %data {boundaryCheck = array<i32: 0, 1, 2>} : !tt.ptr<tensor<1x16x128xbf16>>
     tt.return
   }
 }

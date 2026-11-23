@@ -28,8 +28,10 @@ def rope(X_ptr, CS_ptr, B: tl.constexpr, S: tl.constexpr, NH: tl.constexpr, RD: 
     tl.static_assert(S % BT == 0, "main config has no tail block")
     tl.static_assert(CORES > 0 and OFF == 0, "OFF must be zero for the current (S, RD) CS buffer")
     # Route A: tile kernel pointer args directly via one tla.view(ptr) each.
-    x_ub = tla.alloc((1, BT, NH, RD), tl.float32, space="ub", versions=VERSIONS)
-    cs_ub = tla.alloc((BT, RD), tl.float32, space="ub", versions=VERSIONS)
+    x_ub = tla.alloc((1, BT, NH, RD), tl.float32, space="ub")
+    cs_ub = tla.alloc((BT, RD), tl.float32, space="ub")
+    tla.annotate_multi_buffer(x_ub, VERSIONS)
+    tla.annotate_multi_buffer(cs_ub, VERSIONS)
     n_seq_blk = S // BT
     for task in range(tl.program_id(0), B * n_seq_blk, CORES):
         b = task // n_seq_blk
@@ -45,8 +47,8 @@ def rope(X_ptr, CS_ptr, B: tl.constexpr, S: tl.constexpr, NH: tl.constexpr, RD: 
                 for head in tl.static_range(NH):
                     x0 = tla.simd.vlds(x_ub[0, row, head, 0], dist="NORM")
                     x1 = tla.simd.vlds(x_ub[0, row, head, 64], dist="NORM")
-                    y0 = tla.simd.vfma(tla.simd.vmul(x1, tla.simd.vneg(s)), x0, c)
-                    y1 = tla.simd.vfma(tla.simd.vmul(x1, c), x0, s)
+                    y0 = tla.simd.vmula(tla.simd.vmul(x1, tla.simd.vneg(s)), x0, c)
+                    y1 = tla.simd.vmula(tla.simd.vmul(x1, c), x0, s)
                     tla.simd.vsts(x_ub[0, row, head, 0], y0, dist="NORM_B32")
                     tla.simd.vsts(x_ub[0, row, head, 64], y1, dist="NORM_B32")
         tla.store_ub_to_gm(x_ub, x_blk)  # in-place write-back
