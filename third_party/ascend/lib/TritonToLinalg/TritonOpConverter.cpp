@@ -32,7 +32,6 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
-#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVectorExtras.h"
@@ -635,6 +634,24 @@ SelectCanonicalizer::matchAndRewrite(arith::SelectOp op,
     }
   }
 
+  // Prefix reconstruction improves the measured mix_fused score-update and
+  // probability-selection loops on 950. Limit it to single elements indexed
+  // directly by a for induction variable; data-dependent positions such as
+  // TopK's reduction result must retain the direct-slice optimization.
+  bool useLoopPointPrefix = false;
+  if (dynamicDim != -1 && llvm::all_of(mstate.dims, [](OpFoldResult dim) {
+        return isConstantIntValue(dim, 1);
+      })) {
+    Value position = dynamicOffset;
+    // Look through index casts only to classify the position. Slice creation
+    // and the bounds guard still use the original, potentially narrowed value.
+    while (auto castOp = position.getDefiningOp<arith::IndexCastOp>())
+      position = castOp.getIn();
+    auto forOp = scf::getForInductionVarOwner(position);
+    useLoopPointPrefix = forOp && forOp.getInductionVar() == position;
+  }
+  bool useDirectSlices = useDirectSelectSlices && !useLoopPointPrefix;
+
   // A constant destination needs a writable copy of the whole tensor. For a
   // tail mask, copying the complementary false prefix into a single-use true
   // value instead lets bufferization reuse the computed value's buffer.
@@ -654,11 +671,12 @@ SelectCanonicalizer::matchAndRewrite(arith::SelectOp op,
         sliceDims[i] = mstate.offsets[i];
       sliceOffsets[i] = rewriter.getIndexAttr(0);
     }
-  } else if (!useDirectSelectSlices) {
+  } else if (!useDirectSlices) {
     // A2/A3 require the prefix reconstruction to keep all slice starts at zero.
     // Direct dynamic starts can trigger NPU IR alignment padding and UB
     // overflow. 950 supports unaligned UB copies and can use the original mask
-    // offsets.
+    // offsets. The loop-indexed single-element case above also retains this
+    // prefix path based on the measured codegen behavior.
     SmallVector<OpFoldResult> invertOffsets;
     SmallVector<OpFoldResult> invertFalseDims;
     SmallVector<OpFoldResult> invertTrueDims;
@@ -722,9 +740,9 @@ SelectCanonicalizer::matchAndRewrite(arith::SelectOp op,
   }
   LLVM_DEBUG({
     llvm::dbgs() << "  -> Created "
-                 << (overwriteFalsePrefix    ? "false-prefix"
-                     : useDirectSelectSlices ? "direct"
-                                             : "prefix")
+                 << (overwriteFalsePrefix ? "false-prefix"
+                     : useDirectSlices    ? "direct"
+                                          : "prefix")
                  << " select slices:\n";
     for (Operation *sliceOp : sliceOps)
       llvm::dbgs() << "     " << *sliceOp << "\n";
@@ -812,39 +830,6 @@ BitcastCanonicalizer::matchAndRewrite(triton::BitcastOp bitcastOp,
   return failure();
 }
 
-static Value clampToFiniteFp8Range(Value input, Type dstElemType, Location loc,
-                                   PatternRewriter &rewriter) {
-  if (!isa<Float8E4M3FNType, Float8E5M2Type>(dstElemType))
-    return input;
-
-  auto srcElemType = cast<FloatType>(getElementTypeOrSelf(input.getType()));
-  auto dstFloatType = cast<FloatType>(dstElemType);
-  auto limit = llvm::APFloat::getLargest(dstFloatType.getFloatSemantics());
-  bool losesInfo;
-  limit.convert(srcElemType.getFloatSemantics(),
-                llvm::APFloat::rmNearestTiesToEven, &losesInfo);
-
-  auto createBound = [&](const llvm::APFloat &value) -> Value {
-    auto boundAttr = rewriter.getFloatAttr(srcElemType, value);
-    TypedAttr attr = boundAttr;
-    if (auto tensorType = dyn_cast<RankedTensorType>(input.getType()))
-      attr = DenseElementsAttr::get(tensorType, ArrayRef<Attribute>{boundAttr});
-    return rewriter.create<arith::ConstantOp>(loc, attr);
-  };
-  Value upper = createBound(limit);
-  limit.changeSign();
-  Value lower = createBound(limit);
-
-  // Triton FP8 downcasts saturate finite overflows and infinities. Ordered
-  // comparisons keep NaNs and signed zeros unchanged before rounding.
-  Value above = rewriter.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGT,
-                                               input, upper);
-  Value clamped = rewriter.create<arith::SelectOp>(loc, above, upper, input);
-  Value below = rewriter.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OLT,
-                                               clamped, lower);
-  return rewriter.create<arith::SelectOp>(loc, below, lower, clamped);
-}
-
 LogicalResult
 FpToFpCanonicalizer::matchAndRewrite(triton::FpToFpOp op,
                                      PatternRewriter &rewriter) const {
@@ -907,15 +892,12 @@ FpToFpCanonicalizer::matchAndRewrite(triton::FpToFpOp op,
 
     auto extOp = rewriter.create<arith::ExtFOp>(loc, f32Type, input);
     extOp->setAttr("round_mode", roundModeAttr);
-    Value truncInput =
-        clampToFiniteFp8Range(extOp.getResult(), dstElemType, loc, rewriter);
     auto truncOp =
-        rewriter.create<arith::TruncFOp>(loc, resultType, truncInput);
+        rewriter.create<arith::TruncFOp>(loc, resultType, extOp.getResult());
     truncOp->setAttr("round_mode", roundModeAttr);
     rewriter.replaceOp(op, truncOp.getResult());
   } else if (srcBitwidth > dstBitwidth) {
     // Downcast: use arith.truncf with round_mode=rint
-    input = clampToFiniteFp8Range(input, dstElemType, loc, rewriter);
     auto truncOp = rewriter.create<arith::TruncFOp>(loc, resultType, input);
     truncOp->setAttr("round_mode", roundModeAttr);
     rewriter.replaceOp(op, truncOp.getResult());
@@ -2739,11 +2721,8 @@ LogicalResult DevicePrintConverter::matchAndRewrite(
   auto moduleOp = op->getParentOfType<ModuleOp>();
   rewriter.setInsertionPoint(moduleOp.getBody(),
                              std::prev(moduleOp.getBody()->end()));
-  SmallVector<Type, 4> inputTypes;
-  for (auto arg : op.getArgs()) {
-    inputTypes.push_back(arg.getType());
-  }
-  auto libFnType = rewriter.getFunctionType(inputTypes, {});
+  ValueRange args = adaptor.getArgs();
+  auto libFnType = rewriter.getFunctionType(args.getTypes(), {});
   // See ScanConverter: the name is uniqued before the op is created so that a
   // kernel named "triton_print" cannot make SymbolTable assert.
   auto funcName = generateUniqueFuncName(moduleOp, printFuncNameBase);
@@ -2754,9 +2733,10 @@ LogicalResult DevicePrintConverter::matchAndRewrite(
   funcOp->setAttr(prefixAttrName, prefixAttr);
   auto hexAttr = op.getHexAttr();
   funcOp->setAttr(hexAttrName, hexAttr);
+  funcOp->setAttr("isSigned", op.getIsSignedAttr());
 
   rewriter.setInsertionPoint(op);
-  rewriter.create<func::CallOp>(op.getLoc(), funcOp, op.getArgs());
+  rewriter.create<func::CallOp>(op.getLoc(), funcOp, args);
 
   rewriter.eraseOp(op);
   return success();
@@ -3035,12 +3015,15 @@ DotConverter::matchAndRewrite(triton::ascend::DotOp op, OpAdaptor adaptor,
   if (failed(reconcileDotContractionK(op, a, b, inElemTy, rewriter, loc)))
     return failure();
 
-  // Uninitialized accumulator (accTy): mmadL1 (accumulate=false) overwrites it.
   int64_t numRows = cast<RankedTensorType>(a.getType()).getShape()[0];
   int64_t numCols = cast<RankedTensorType>(b.getType()).getShape()[1];
   auto ndResultTy = RankedTensorType::get({numRows, numCols}, accTy);
   Value acc = rewriter.create<tensor::EmptyOp>(
       loc, ArrayRef<int64_t>{numRows, numCols}, accTy);
+  // DynamicCV can split the accumulator add out of the matmul.
+  Value zero =
+      rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(accTy));
+  acc = rewriter.create<linalg::FillOp>(loc, zero, acc).getResult(0);
   auto matmul = rewriter.create<linalg::MatmulOp>(
       loc, TypeRange{ndResultTy}, ValueRange{a, b}, ValueRange{acc});
   matmul->setAttr("input_precision", rewriter.getStringAttr("ieee"));
@@ -3223,9 +3206,13 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
                      rhsElemType == triton::ScaleDotElemType::E5M2);
   bool isFP4Input = (lhsElemType == triton::ScaleDotElemType::E2M1) &&
                     (rhsElemType == triton::ScaleDotElemType::E2M1);
-  // MatMulMx consumes K-packed bytes and E8M0 scales. Its small-K
-  // decomposition requires at least 64 packed bytes (128 FP4 elements).
-  constexpr int64_t minimumNativeFp4StorageK = 64;
+  // Each E8M0 scale covers 32 consecutive elements along K. MatMulMx
+  // hardware requires K to span an integer number of 2-scale-block
+  // groups (64 elements for FP8, 64 packed bytes for FP4). K < this
+  // value or K not divisible by it should fall back to the software
+  // decomposed path rather than forming a native MatMulMxOp.
+  constexpr int64_t nativeMxKAlignment = 64;
+  constexpr int64_t minimumNativeFp4StorageK = nativeMxKAlignment;
   auto hasE8M0Scale = [](Value scale) {
     return !scale || cast<RankedTensorType>(scale.getType())
                          .getElementType()
@@ -3257,6 +3244,22 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
                    .getResult(0);
   }
   if (useNativeMx) {
+    auto lhsTy = cast<RankedTensorType>(lhs.getType());
+    auto rhsTy = cast<RankedTensorType>(rhs.getType());
+    int64_t lhsK = lhsTy.getShape()[1];
+    int64_t rhsK = rhsTy.getShape()[0];
+
+    if (!ShapedType::isDynamic(lhsK) && !ShapedType::isDynamic(rhsK)) {
+      if (lhsK != rhsK) {
+        return op.emitError()
+               << "MatMulMx: lhs K (" << lhsK << ") != rhs K (" << rhsK << ")";
+      }
+      if (lhsK % nativeMxKAlignment != 0) {
+        return op.emitError()
+               << "MatMulMx: static K = " << lhsK << ", must be divisible by "
+               << nativeMxKAlignment;
+      }
+    }
     if (!rhsScale) {
       auto rhsTy = cast<RankedTensorType>(rhs.getType());
       int64_t k = rhsTy.getDimSize(rhsTy.getRank() - 2);
