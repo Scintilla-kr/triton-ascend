@@ -64,19 +64,26 @@ class UnsupportedDtypeError(TypeError):
 
 
 def arch_bucket(arch):
-    """Classify an options.arch value into an "a2" / "a5" / "a6" bucket.
+    """Classify an options.arch value into an "a2a3" / "a5" / "a6" bucket.
 
     A5 and A6 share the register-based pipeline; they are distinguished
     by generation only for bucket-specific tuning heuristics.
     """
+
+    if not arch:
+        try:
+            from triton.runtime import driver
+            arch = getattr(driver.active.get_current_target(), "arch", None)
+        except Exception:
+            arch = None
     try:
         from triton.backends.ascend.utils import AscendArchGen, arch_generation
         gen = arch_generation(arch)
         if gen == AscendArchGen.GEN6:
             return "a6"
-        return "a5" if gen == AscendArchGen.GEN5 else "a2"
+        return "a5" if gen == AscendArchGen.GEN5 else "a2a3"
     except Exception:
-        return "a2"
+        return "a2a3"
 
 
 def _bucket_from_semantic(semantic):
